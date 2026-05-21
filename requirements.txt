@@ -1,0 +1,12 @@
+# OpenAI + DingTalk - 聊天机器人
+openai>=1.0.0
+python-dotenv==1.0.0
+dingtalk-stream==0.17.3
+alibabacloud-dingtalk>=1.0.0
+alibabacloud-tea-openapi>=0.3.0
+alibabacloud-tea-util>=0.3.0
+
+# OpenCV - 摄像头操作和图像处理
+opencv-python>=4.5.0
+# NumPy - 图像数组处理（OpenCV的依赖）
+numpy>=1.19.0
