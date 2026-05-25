@@ -8,5 +8,13 @@ alibabacloud-tea-util>=0.3.0
 
 # OpenCV - 摄像头操作和图像处理
 opencv-python>=4.5.0
-# NumPy - 图像数组处理（OpenCV的依赖）
 numpy>=1.19.0
+
+# 浇花助理新增依赖
+apscheduler>=3.10.0
+PyYAML>=6.0
+Pillow>=10.0.0
+requests>=2.31.0
+
+# 仅在树莓派上需要（pip install 时若非树莓派可忽略此行）
+RPi.GPIO>=0.7.1; platform_machine == "armv7l" or platform_machine == "aarch64"

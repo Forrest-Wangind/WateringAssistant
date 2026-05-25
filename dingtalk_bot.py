@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-钉钉AI助手 - Stream模式
-使用钉钉官方SDK发送消息
+"""钉钉机器人：DeepSeek 闲聊 + 浇花助理控制命令。
+
+命令路由（在 _route_command 中处理）：
+  帮助 / help                显示命令清单
+  状态                       查看各通道开关与剩余时长
+  浇水 <通道id> [秒数]        立即浇水，秒数缺省取 default_duration_seconds
+  停止 <通道id> | 停止 全部   关闭通道
+  报告                       立即生成一次图文报告
+  清空                       清空 DeepSeek 对话历史
+其余消息走 DeepSeek 闲聊。
 """
 
-import os
 import json
 import logging
-from dotenv import load_dotenv
+import os
+import time
+from typing import Optional
+
 import dingtalk_stream
-from openai import OpenAI
-from alibabacloud_dingtalk.robot_1_0.client import Client as dingtalkrobot_1_0Client
-from alibabacloud_dingtalk.oauth2_1_0.client import Client as dingtalkoauth2_1_0Client
-from alibabacloud_tea_openapi import models as open_api_models
-from alibabacloud_dingtalk.robot_1_0 import models as dingtalkrobot__1__0_models
 from alibabacloud_dingtalk.oauth2_1_0 import models as dingtalkoauth_2__1__0_models
+from alibabacloud_dingtalk.oauth2_1_0.client import Client as dingtalkoauth2_1_0Client
+from alibabacloud_dingtalk.robot_1_0 import models as dingtalkrobot__1__0_models
+from alibabacloud_dingtalk.robot_1_0.client import Client as dingtalkrobot_1_0Client
+from alibabacloud_tea_openapi import models as open_api_models
 from alibabacloud_tea_util import models as util_models
-from alibabacloud_tea_util.client import Client as UtilClient
+from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
-# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -33,314 +41,299 @@ logger = logging.getLogger(__name__)
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DINGTALK_CLIENT_ID = os.getenv("DINGTALK_CLIENT_ID")
 DINGTALK_CLIENT_SECRET = os.getenv("DINGTALK_CLIENT_SECRET")
-DINGTALK_ROBOT_CODE = os.getenv("DINGTALK_ROBOT_CODE")  # 机器人代码
+DINGTALK_ROBOT_CODE = os.getenv("DINGTALK_ROBOT_CODE")
 
-# 初始化 DeepSeek OpenAI 客户端
 deepseek_client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"
-)
+    base_url="https://api.deepseek.com",
+) if DEEPSEEK_API_KEY else None
 
-# 会话历史存储
 conversation_history = {}
-
-# 全局 access token 缓存
-access_token_cache = {
-    'token': None,
-    'expires_in': 0
-}
+access_token_cache = {"token": None, "expires_in": 0}
 
 
+# ========== 钉钉基础工具 ==========
 def get_dingtalk_access_token():
-    """获取钉钉访问令牌 - 使用官方 OAuth2.0 方式"""
     try:
-        # 检查缓存
-        import time
-        if access_token_cache['token'] and time.time() < access_token_cache['expires_in']:
-            logger.info("使用缓存的 access token")
-            return access_token_cache['token']
-        
-        # 创建 OAuth2 客户端
+        if access_token_cache["token"] and time.time() < access_token_cache["expires_in"]:
+            return access_token_cache["token"]
+
         config = open_api_models.Config()
-        config.protocol = 'https'
-        config.region_id = 'central'
+        config.protocol = "https"
+        config.region_id = "central"
         client = dingtalkoauth2_1_0Client(config)
-        
-        # 构建请求
-        get_access_token_request = dingtalkoauth_2__1__0_models.GetAccessTokenRequest(
+
+        req = dingtalkoauth_2__1__0_models.GetAccessTokenRequest(
             app_key=DINGTALK_CLIENT_ID,
-            app_secret=DINGTALK_CLIENT_SECRET
+            app_secret=DINGTALK_CLIENT_SECRET,
         )
-        
-        # 发送请求
-        response = client.get_access_token(get_access_token_request).body
-        # 缓存 token
-        access_token_cache['token'] = response.access_token
-        # 设置过期时间（提前5分钟刷新）
-        access_token_cache['expires_in'] = time.time() + response.expire_in - 300
-        
-        logger.info(f"成功获取 access token，有效期: {response.expire_in}秒")
+        response = client.get_access_token(req).body
+        access_token_cache["token"] = response.access_token
+        access_token_cache["expires_in"] = time.time() + response.expire_in - 300
+        logger.info("成功获取 access token，有效期: %ss", response.expire_in)
         return response.access_token
-        
     except Exception as e:
-        logger.error(f"获取钉钉Access Token失败: {str(e)}")
-        if hasattr(e, 'code') and hasattr(e, 'message'):
-            logger.error(f"错误码: {e.code}, 错误信息: {e.message}")
+        logger.error("获取钉钉 Access Token 失败: %s", e)
         return None
 
 
-def send_dingtalk_message(user_id: str, text: str):
-    """使用钉钉官方SDK发送单聊消息"""
+def send_dingtalk_message(user_id: str, text: str) -> bool:
     try:
-        # 获取 access token
-        access_token = get_dingtalk_access_token()
-        if not access_token:
-            logger.error("无法获取 access token")
+        token = get_dingtalk_access_token()
+        if not token:
             return False
-        
-        # 创建机器人客户端
+
         config = open_api_models.Config()
-        config.protocol = 'https'
-        config.region_id = 'central'
+        config.protocol = "https"
+        config.region_id = "central"
         client = dingtalkrobot_1_0Client(config)
-        
-        # 构建请求头
-        batch_send_otoheaders = dingtalkrobot__1__0_models.BatchSendOTOHeaders()
-        batch_send_otoheaders.x_acs_dingtalk_access_token = access_token
-        
-        # 构建消息参数
-        msg_param = json.dumps({
-            "content": text
-        })
-        
-        # 构建请求
-        batch_send_otorequest = dingtalkrobot__1__0_models.BatchSendOTORequest(
+
+        headers = dingtalkrobot__1__0_models.BatchSendOTOHeaders()
+        headers.x_acs_dingtalk_access_token = token
+
+        req = dingtalkrobot__1__0_models.BatchSendOTORequest(
             robot_code=DINGTALK_ROBOT_CODE,
             user_ids=[user_id],
-            msg_key="sampleText",  # 使用文本消息
-            msg_param=msg_param
+            msg_key="sampleText",
+            msg_param=json.dumps({"content": text}),
         )
-        
-        # 发送消息
-        response = client.batch_send_otowith_options(
-            batch_send_otorequest, 
-            batch_send_otoheaders, 
-            util_models.RuntimeOptions()
-        )
-        
-        logger.info(f"成功发送消息给用户 {user_id}，内容长度: {len(text)}")
+        client.batch_send_otowith_options(req, headers, util_models.RuntimeOptions())
         return True
-        
     except Exception as e:
-        logger.error(f"发送钉钉消息失败: {str(e)}")
-        if hasattr(e, 'code') and hasattr(e, 'message'):
-            logger.error(f"错误码: {e.code}, 错误信息: {e.message}")
+        logger.error("发送钉钉消息失败: %s", e)
         return False
 
 
-def call_deepseek(question: str, conversation_id: str = None) -> str:
-    """使用 OpenAI SDK 调用 DeepSeek API 获取回复"""
+def call_deepseek(question: str, conversation_id: Optional[str] = None) -> str:
+    if deepseek_client is None:
+        return "（DeepSeek 未配置，闲聊功能关闭）"
     try:
-        # 构建消息列表
         messages = [
             {"role": "system", "content": "你是一个专业的AI助手，请用简洁、友好的中文回答问题。"}
         ]
-        
-        # 添加历史对话（最近10条）
         if conversation_id and conversation_id in conversation_history:
-            history = conversation_history[conversation_id][-10:]
-            messages.extend(history)
-        
-        # 添加当前问题
+            messages.extend(conversation_history[conversation_id][-10:])
         messages.append({"role": "user", "content": question})
-        
-        logger.info(f"调用DeepSeek API，问题: {question[:50]}...")
-        
-        # 调用 DeepSeek API
+
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=messages,
             temperature=0.7,
             max_tokens=2000,
-            stream=False
+            stream=False,
         )
-        
-        # 提取回复内容
         answer = response.choices[0].message.content
-        logger.info(f"DeepSeek回复成功，长度: {len(answer)}")
-        
-        # 保存对话历史
         if conversation_id:
-            if conversation_id not in conversation_history:
-                conversation_history[conversation_id] = []
-            conversation_history[conversation_id].append({"role": "user", "content": question})
-            conversation_history[conversation_id].append({"role": "assistant", "content": answer})
-            
-            # 限制历史长度（最多20条，即10轮对话）
+            conversation_history.setdefault(conversation_id, []).append(
+                {"role": "user", "content": question}
+            )
+            conversation_history[conversation_id].append(
+                {"role": "assistant", "content": answer}
+            )
             if len(conversation_history[conversation_id]) > 20:
                 conversation_history[conversation_id] = conversation_history[conversation_id][-20:]
-        
         return answer
-        
     except Exception as e:
-        logger.error(f"DeepSeek API异常: {str(e)}", exc_info=True)
-        return f"抱歉，处理您的问题时出现错误：{str(e)}"
+        logger.error("DeepSeek API 异常: %s", e, exc_info=True)
+        return f"抱歉，处理您的问题时出现错误：{e}"
 
 
-class DeepSeekChatbotHandler(dingtalk_stream.ChatbotHandler):
-    """自定义消息处理器"""
-    
+# ========== 命令路由 ==========
+HELP_TEXT = """🌱 浇花助理命令
+
+控制类：
+  浇水 <通道> [秒数]   例: 浇水 1 30
+  停止 <通道|全部>      例: 停止 1 / 停止 全部
+  状态                  查看各通道当前状态
+  报告                  立即生成一次图文日报
+
+其它：
+  清空 / 重置           清空闲聊上下文
+  帮助 / help           显示本帮助
+其余消息默认走 DeepSeek 闲聊。"""
+
+
+class WateringChatbotHandler(dingtalk_stream.ChatbotHandler):
+    """钉钉消息处理：先尝试命令路由，未命中再走 DeepSeek 闲聊。"""
+
+    def __init__(self, controller=None, reporter=None, default_duration: int = 30):
+        super().__init__()
+        self._controller = controller
+        self._reporter = reporter
+        self._default_duration = default_duration
+
     async def process(self, callback: dingtalk_stream.CallbackMessage):
-        """处理接收到的消息"""
         try:
             data = callback.data
-            
-            # 获取消息内容
-            msg_type = data.get('msgtype', '')
-            incoming_message = ""
-            
-            if msg_type == 'text':
-                incoming_message = data.get('text', {}).get('content', '').strip()
-            elif msg_type == 'voice':
-                incoming_message = data.get('voice', {}).get('text', '').strip()
+            msg_type = data.get("msgtype", "")
+            if msg_type == "text":
+                incoming = data.get("text", {}).get("content", "").strip()
+            elif msg_type == "voice":
+                incoming = data.get("voice", {}).get("text", "").strip()
             else:
-                logger.info(f"暂不支持的消息类型: {msg_type}")
-                return dingtalk_stream.AckMessage.STATUS_OK,"unsupported"
-            
-            # 获取发送者信息
-            sender_staff_id = data.get('senderStaffId', '')
-            sender_nick = data.get('senderNick', '未知')
-            
-            # 获取会话信息
-            conversation_id = data.get('conversationId', '')
-            conversation_type = data.get('conversationType', '')
-            is_group = conversation_type == '2'
-            
-            chat_type = "群聊" if is_group else "单聊"
-            logger.info(f"收到{chat_type}消息 - 发送者: {sender_nick}, ID: {sender_staff_id}, 内容: {incoming_message[:50]}...")
-            
-            if not incoming_message or not sender_staff_id:
-                return dingtalk_stream.AckMessage.STATUS_OK,"ignore"
-            
-            # 处理群聊@机器人
-            question = incoming_message
-            if is_group:
-                # 移除 @机器人 前缀
-                if incoming_message.startswith('@'):
-                    parts = incoming_message.split(' ', 1)
-                    if len(parts) > 1:
-                        question = parts[1].strip()
-                    else:
-                        question = ""
-            
-            # 处理特殊命令
-            if question.lower() in ['清空', '清除', '重置', 'clear', 'reset']:
-                if conversation_id in conversation_history:
-                    del conversation_history[conversation_id]
-                    reply_text = "✅ 已清除对话历史！"
-                else:
-                    reply_text = "✅ 对话历史已清空"
-                
-                # 发送回复
-                send_dingtalk_message(sender_staff_id, reply_text)
-                return dingtalk_stream.AckMessage.STATUS_OK,"clear"
-            
-            if question.lower() in ['帮助', 'help', '/help']:
-                help_text = """🤖 钉钉AI助手使用帮助
+                return dingtalk_stream.AckMessage.STATUS_OK, "unsupported"
 
-功能特性：
-- 💬 智能对话：基于DeepSeek AI模型
-- 📝 上下文记忆：记住对话历史
-- 🧹 清空历史：发送"清空"或"重置"
+            sender_id = data.get("senderStaffId", "")
+            sender_nick = data.get("senderNick", "未知")
+            conv_id = data.get("conversationId", "")
+            is_group = data.get("conversationType", "") == "2"
 
-使用方式：
-- 单聊：直接发送消息即可
-- 群聊：@机器人后发送消息
+            logger.info("收到消息: %s -> %s", sender_nick, incoming[:50])
 
-命令列表：
-- 清空/重置：清除当前会话的对话历史
-- 帮助/help：显示此帮助信息"""
-                
-                send_dingtalk_message(sender_staff_id, help_text)
-                return dingtalk_stream.AckMessage.STATUS_OK,"help"
-            
-            if not question or question.strip() == "":
-                send_dingtalk_message(sender_staff_id, "您好，请问有什么可以帮您？")
-                return dingtalk_stream.AckMessage.STATUS_OK,"ask"
-            
-            # 调用DeepSeek获取回复
-            answer = call_deepseek(question, conversation_id)
-            
-            # 发送回复
-            send_dingtalk_message(sender_staff_id, answer)
-            
+            if not incoming or not sender_id:
+                return dingtalk_stream.AckMessage.STATUS_OK, "ignore"
+
+            # 群聊去掉 @机器人 前缀
+            question = incoming
+            if is_group and incoming.startswith("@"):
+                parts = incoming.split(" ", 1)
+                question = parts[1].strip() if len(parts) > 1 else ""
+
+            handled, reply = self._route_command(question, conv_id)
+            if handled:
+                send_dingtalk_message(sender_id, reply)
+                return dingtalk_stream.AckMessage.STATUS_OK, "command"
+
+            if not question:
+                send_dingtalk_message(sender_id, "您好，请问有什么可以帮您？输入"帮助"查看命令。")
+                return dingtalk_stream.AckMessage.STATUS_OK, "ask"
+
+            answer = call_deepseek(question, conv_id)
+            send_dingtalk_message(sender_id, answer)
         except Exception as e:
-            logger.error(f"处理消息时出错: {str(e)}", exc_info=True)
+            logger.error("处理消息异常: %s", e, exc_info=True)
+
+        return dingtalk_stream.AckMessage.STATUS_OK, "success"
+
+    # ---------- 命令解析 ----------
+    def _route_command(self, text: str, conv_id: str):
+        """返回 (是否命中命令, 回复文本)。"""
+        if not text:
+            return False, ""
+
+        lower = text.lower().strip()
+        if lower in {"帮助", "help", "/help", "?", "？"}:
+            return True, HELP_TEXT
+        if lower in {"清空", "清除", "重置", "clear", "reset"}:
+            conversation_history.pop(conv_id, None)
+            return True, "✅ 已清空闲聊上下文"
+
+        tokens = text.split()
+        head = tokens[0]
+
+        if head in {"状态", "status"}:
+            return True, self._cmd_status()
+
+        if head in {"浇水", "water"}:
+            return True, self._cmd_water(tokens[1:])
+
+        if head in {"停止", "stop", "关闭"}:
+            return True, self._cmd_stop(tokens[1:])
+
+        if head in {"报告", "report", "日报"}:
+            return True, self._cmd_report()
+
+        return False, ""
+
+    def _require_controller(self) -> Optional[str]:
+        if self._controller is None:
+            return "⚠️ GPIO 控制器未初始化（可能不在树莓派环境）"
+        return None
+
+    def _cmd_status(self) -> str:
+        if (err := self._require_controller()):
+            return err
+        states = self._controller.list_channels()
+        lines = ["📊 通道状态"]
+        for s in states:
+            if s.is_open and s.will_close_at:
+                remain = max(0, int(s.will_close_at - time.time()))
+                lines.append(f"  [{s.channel_id}] {s.name}: 🟢 开 (剩余 {remain}s)")
+            else:
+                lines.append(f"  [{s.channel_id}] {s.name}: ⚪ 关")
+        return "\n".join(lines)
+
+    def _cmd_water(self, args) -> str:
+        if (err := self._require_controller()):
+            return err
+        if not args:
+            return "用法: 浇水 <通道id> [秒数]"
+        try:
+            channel_id = int(args[0])
+        except ValueError:
+            return f"通道 id 必须是数字: {args[0]}"
+
+        duration = self._default_duration
+        if len(args) >= 2:
             try:
-                if 'sender_staff_id' in locals() and sender_staff_id:
-                    send_dingtalk_message(sender_staff_id, f"处理您的消息时出现错误：{str(e)}")
-            except Exception:
-                pass
-        
-        return dingtalk_stream.AckMessage.STATUS_OK,"success"
+                duration = int(args[1])
+            except ValueError:
+                return f"秒数必须是整数: {args[1]}"
+
+        try:
+            state = self._controller.open_valve(channel_id, duration)
+        except ValueError as e:
+            return f"❌ {e}"
+        except Exception as e:
+            logger.exception("开阀失败")
+            return f"❌ 操作失败: {e}"
+        return f"💧 通道 {state.channel_id} ({state.name}) 已开阀 {duration}s"
+
+    def _cmd_stop(self, args) -> str:
+        if (err := self._require_controller()):
+            return err
+        if not args:
+            return "用法: 停止 <通道id> | 停止 全部"
+        target = args[0]
+        if target in {"全部", "all", "*"}:
+            self._controller.close_all()
+            return "✅ 所有通道已关闭"
+        try:
+            channel_id = int(target)
+        except ValueError:
+            return f"通道 id 必须是数字: {target}"
+        try:
+            state = self._controller.close_valve(channel_id)
+        except ValueError as e:
+            return f"❌ {e}"
+        return f"✅ 通道 {state.channel_id} ({state.name}) 已关闭"
+
+    def _cmd_report(self) -> str:
+        if self._reporter is None:
+            return "⚠️ 报告模块未启用"
+        # 报告流程含 AI 调用，时间较长，异步执行避免阻塞 stream 回调
+        import threading
+        threading.Thread(target=self._reporter.generate_and_send, daemon=True).start()
+        return "📷 已开始拍照分析，稍后将推送图文报告"
+
+
+# 历史名保留（外部代码可能引用）
+DeepSeekChatbotHandler = WateringChatbotHandler
 
 
 def main():
-    """主函数：启动Stream模式客户端"""
-    
-    # 检查必要的环境变量
-    if not DEEPSEEK_API_KEY:
-        logger.error("=" * 50)
-        logger.error("❌ 请设置 DEEPSEEK_API_KEY 环境变量")
-        logger.error("=" * 50)
+    """单独运行 dingtalk_bot.py 时的入口（不含浇花功能）。
+    生产部署请使用 main.py，会注入 GPIO/Reporter 服务。
+    """
+    if not all([DEEPSEEK_API_KEY, DINGTALK_CLIENT_ID, DINGTALK_CLIENT_SECRET, DINGTALK_ROBOT_CODE]):
+        logger.error("环境变量缺失，请检查 .env")
         return
-    
-    if not DINGTALK_CLIENT_ID or not DINGTALK_CLIENT_SECRET:
-        logger.error("=" * 50)
-        logger.error("❌ 请设置 DINGTALK_CLIENT_ID 和 DINGTALK_CLIENT_SECRET")
-        logger.error("=" * 50)
+
+    if not get_dingtalk_access_token():
+        logger.error("Access Token 获取失败")
         return
-    
-    if not DINGTALK_ROBOT_CODE:
-        logger.error("=" * 50)
-        logger.error("❌ 请设置 DINGTALK_ROBOT_CODE 环境变量")
-        logger.error("在钉钉开放平台-机器人-机器人配置中查看")
-        logger.error("=" * 50)
-        return
-    
-    # 测试获取 access token
-    logger.info("测试获取钉钉 Access Token...")
-    test_token = get_dingtalk_access_token()
-    if test_token:
-        logger.info("✅ Access Token 获取成功")
-    else:
-        logger.error("❌ Access Token 获取失败，请检查配置")
-        return
-    
-    # 配置钉钉Stream客户端
+
     credential = dingtalk_stream.Credential(DINGTALK_CLIENT_ID, DINGTALK_CLIENT_SECRET)
     client = dingtalk_stream.DingTalkStreamClient(credential=credential)
-    
-    # 注册回调处理器
     client.register_callback_handler(
-        '/v1.0/im/bot/messages/get',
-        DeepSeekChatbotHandler()
+        "/v1.0/im/bot/messages/get",
+        WateringChatbotHandler(),
     )
-    
-    logger.info("=" * 50)
-    logger.info("🚀 钉钉AI助手启动中...")
-    logger.info(f"📱 Client ID: {DINGTALK_CLIENT_ID[:10]}...")
-    logger.info(f"🤖 Robot Code: {DINGTALK_ROBOT_CODE[:10]}...")
-    logger.info("💬 请在钉钉中@机器人 或 私聊测试")
-    logger.info("⌨️  按 Ctrl+C 停止服务")
-    logger.info("=" * 50)
-    
+    logger.info("🚀 钉钉机器人启动（仅闲聊模式）")
     try:
         client.start_forever()
     except KeyboardInterrupt:
-        logger.info("✅ 服务已停止")
-    except Exception as e:
-        logger.error(f"❌ 启动失败: {str(e)}", exc_info=True)
+        logger.info("✅ 已停止")
 
 
 if __name__ == "__main__":
