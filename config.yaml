@@ -1,67 +1,76 @@
-# 浇花助理配置文件
-# 修改本文件后重启服务生效
+system:
+  log_level: INFO
+  data_dir: ./data
+  photo_dir: ./data/photos
+  report_dir: ./data/reports
+  timezone: Asia/Shanghai
+  mock_hardware: true   # 在非树莓派环境下用模拟实现，部署到 Pi 时改为 false
 
-# ========== 浇水通道 ==========
-# 4 路继电器，BCM 编号
-# active_low: 多数继电器板低电平触发，置 true；如继电器为高电平触发改为 false
+# 4 路浇水通道：每一路连接一个继电器驱动的 12V 水泵
+# pin 使用 BCM 编号
 channels:
   - id: 1
-    name: 阳台月季
-    gpio_pin: 17
+    name: 热带植物
+    pin: 17
+    bucket: 桶A
+    flow_ml_per_sec: 18      # 实测水泵流量
+    default_volume_ml: 800   # 单次默认浇水量
+    schedule_cron: "0 7 * * *"   # 每天 7:00
   - id: 2
-    name: 客厅绿萝
-    gpio_pin: 27
+    name: 多肉植物
+    pin: 27
+    bucket: 桶B
+    flow_ml_per_sec: 18
+    default_volume_ml: 120
+    schedule_cron: "0 8 */7 * *"   # 每 7 天 8:00
   - id: 3
-    name: 卧室多肉
-    gpio_pin: 22
+    name: 中生植物
+    pin: 22
+    bucket: 桶C
+    flow_ml_per_sec: 18
+    default_volume_ml: 500
+    schedule_cron: "0 7 */2 * *"   # 每 2 天 7:00
   - id: 4
-    name: 厨房香草
-    gpio_pin: 23
+    name: 水生植物
+    pin: 23
+    bucket: 桶D
+    flow_ml_per_sec: 18
+    default_volume_ml: 1500      # 用于补水，保持水位
+    schedule_cron: "0 9 */3 * *"   # 每 3 天 9:00
 
-relay:
-  active_low: true
-  # 单次浇水时长上限（秒），防止程序异常导致持续放水
-  max_duration_seconds: 600
-  # 默认手动浇水时长（秒）
-  default_duration_seconds: 30
+safety:
+  max_single_run_sec: 180        # 单次最长运行 3 分钟，防止干转
+  cooldown_sec: 30               # 同一通道两次启动之间的冷却时间
+  global_lock: true              # 同一时刻只允许一路水泵运行
 
-# ========== 定时浇水任务 ==========
-# 每条任务一行 cron 表达式（分 时 日 月 周），与 APScheduler 一致
-# duration_seconds 为该次浇水时长
-schedules:
-  - name: 早晨浇花
-    cron: "0 7 * * *"
-    channel_id: 1
-    duration_seconds: 60
-  - name: 傍晚补水
-    cron: "0 19 * * *"
-    channel_id: 2
-    duration_seconds: 45
+camera:
+  resolution: [1920, 1080]
+  warmup_sec: 2
 
-# ========== 每日图文报告 ==========
-report:
-  enabled: true
-  # 报告生成时间（24h cron）
-  cron_list:
-    - "0 8 * * *"
-    - "0 18 * * *"
-  # 拍照分辨率
-  image_width: 1280
-  image_height: 720
-  # 接收报告的钉钉用户 ID（在 .env 的 DINGTALK_RECIPIENT_USER_IDS 中维护，留空则用此处）
-  recipient_user_ids: []
+ai:
+  provider: anthropic
+  model: claude-opus-4-7
+  api_key_env: ANTHROPIC_API_KEY
+  max_tokens: 1500
+  prompt: |
+    你是一名资深园艺师。请基于这张花园照片，分析画面中可见盆栽的整体生长状况，
+    分别从下列维度给出图文报告：
+      1. 整体观感与构图
+      2. 叶色 / 形态异常（黄叶、徒长、虫害、缺水、烂根迹象）
+      3. 浇水建议（结合热带 / 多肉 / 中生 / 水生 4 类）
+      4. 下一步养护 TODO 清单
+    使用 Markdown，简洁分点，并在结尾给出 1-5 分的综合健康评分。
 
-# ========== 视觉模型 ==========
-vision:
-  provider: dashscope
-  model: qwen-vl-max
-  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  # 单次分析超时（秒）
-  timeout: 60
+dingtalk:
+  # 自定义机器人，用于主动推送（图片 / 报告 / 状态）
+  webhook_env: DINGTALK_WEBHOOK
+  secret_env: DINGTALK_SECRET
+  # Stream 模式接收 @机器人 消息（无需公网回调）
+  client_id_env: DINGTALK_CLIENT_ID
+  client_secret_env: DINGTALK_CLIENT_SECRET
+  # 仅允许下列 userId / unionId 下发浇花指令
+  allowed_users: []
 
-# ========== 数据存储 ==========
-storage:
-  photo_dir: data/photos
-  report_dir: data/reports
-  # 仅保留最近 N 天照片，0 表示不清理
-  keep_days: 30
+web:
+  host: 0.0.0.0
+  port: 8080
