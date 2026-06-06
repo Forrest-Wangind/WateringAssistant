@@ -130,6 +130,38 @@ def help_text() -> str:
     return _HELP_TEXT
 
 
+# ---------- 消息文本提取 ----------
+def _extract_text(incoming: ChatbotMessage) -> str:
+    """从不同类型的钉钉消息中提取可处理的文本。
+
+    支持的消息类型：
+      - text  : 普通文本
+      - audio : 语音消息，优先使用服务端语音识别结果（recognition），
+                无识别文字时返回空串（无法处理）
+    """
+    msg_type = (incoming.message_type or "").lower()
+
+    if msg_type == "audio":
+        # 语音消息数据在 incoming.extensions，结构：
+        # {"openThreadId": "...", "content": {"downloadCode": "...", "recognition": "..."}}
+        extensions = incoming.extensions or {}
+        if isinstance(extensions, str):
+            try:
+                extensions = json.loads(extensions)
+            except json.JSONDecodeError:
+                extensions = {}
+        audio_content = extensions.get("content", {})
+        recognition = audio_content.get("recognition", "")
+        if recognition:
+            logger.info("语音识别文字: %s", recognition)
+        else:
+            logger.info("语音消息无识别文字，downloadCode=%s", audio_content.get("downloadCode", "")[:16])
+        return recognition.strip()
+
+    # 默认：文本消息（msgtype=text）
+    return (incoming.text.content if incoming.text else "") or ""
+
+
 # ---------- Stream 模式 ----------
 class WateringChatbotHandler(ChatbotHandler):
     """接收 @机器人 消息并交给 handle_command 回调处理。"""
@@ -143,9 +175,16 @@ class WateringChatbotHandler(ChatbotHandler):
 
     async def process(self, callback: dingtalk_stream.CallbackMessage):
         incoming = ChatbotMessage.from_dict(callback.data)
-        text = (incoming.text.content if incoming.text else "") or ""
         sender_id = incoming.sender_staff_id or incoming.sender_id
-        logger.info("收到钉钉消息 sender=%s text=%s", sender_id, text)
+
+        text = _extract_text(incoming)
+        logger.info("收到钉钉消息 sender=%s msgtype=%s text=%s",
+                    sender_id, incoming.message_type, text)
+
+        if not text:
+            logger.info("消息无可处理文本（msgtype=%s），跳过", incoming.message_type)
+            return AckMessage.STATUS_OK, "OK"
+
         try:
             reply = self._command_handler(text, sender_id)
         except Exception as exc:  # noqa: BLE001
