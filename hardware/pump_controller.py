@@ -45,6 +45,58 @@ class _RpiGpioBackend(_GpioBackend):
         self._GPIO.cleanup()
 
 
+class _GpiodBackend(_GpioBackend):
+    """gpiod (libgpiod v2) 后端 — 支持 Pi 5 等新硬件。"""
+
+    def __init__(self) -> None:
+        import gpiod
+
+        self._chip_path = self._find_chip()
+        self._requests: Dict[int, gpiod.LineRequest] = {}
+
+    @staticmethod
+    def _find_chip() -> str:
+        import gpiod
+
+        for i in range(8):
+            path = f"/dev/gpiochip{i}"
+            try:
+                with gpiod.Chip(path) as chip:
+                    info = chip.get_info()
+                    if "rp1" in info.label.lower() or "pinctrl" in info.label.lower():
+                        return path
+            except OSError:
+                continue
+        return "/dev/gpiochip0"
+
+    def setup(self, pin: int) -> None:
+        import gpiod
+
+        settings = gpiod.LineSettings(
+            direction=gpiod.line.Direction.OUTPUT,
+            output_value=gpiod.line.Value.ACTIVE,  # HIGH = 继电器断开
+        )
+        req = gpiod.request_lines(
+            self._chip_path, config={pin: settings}, consumer="pump"
+        )
+        self._requests[pin] = req
+
+    def write(self, pin: int, value: int) -> None:
+        import gpiod
+
+        # value=1 → ON  → INACTIVE (LOW)；value=0 → OFF → ACTIVE (HIGH)
+        req = self._requests[pin]
+        req.set_value(pin, gpiod.line.Value.ACTIVE if value else gpiod.line.Value.INACTIVE)
+
+    def cleanup(self) -> None:
+        for req in self._requests.values():
+            try:
+                req.release()
+            except Exception:  # noqa: BLE001
+                pass
+        self._requests.clear()
+
+
 class _MockGpioBackend(_GpioBackend):
     def __init__(self) -> None:
         self.state: Dict[int, int] = {}
@@ -66,9 +118,13 @@ def _make_backend(mock: bool) -> _GpioBackend:
     if mock:
         return _MockGpioBackend()
     try:
+        return _GpiodBackend()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         return _RpiGpioBackend()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("RPi.GPIO 不可用，自动回退到 mock 模式: %s", exc)
+        logger.warning("GPIO 后端不可用，自动回退到 mock 模式: %s", exc)
         return _MockGpioBackend()
 
 
