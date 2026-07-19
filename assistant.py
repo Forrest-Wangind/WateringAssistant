@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 from ai.plant_analyzer import AnalysisReport, PlantAnalyzer
 from dingtalk.bot import Command, DingTalkBot, help_text, parse_command
 from hardware.camera import Camera
-from hardware.pump_controller import PumpController
+from hardware.valve_controller import ValveController
 from utils import find_channel_by_name, get_channel
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,7 @@ class WateringAssistant:
         sys_cfg = cfg.get("system", {})
         safety = cfg.get("safety", {})
 
-        self.pump = PumpController(
+        self.valve = ValveController(
             channels=cfg["channels"],
             mock=bool(sys_cfg.get("mock_hardware", False)),
             max_single_run_sec=int(safety.get("max_single_run_sec", 180)),
@@ -41,17 +41,16 @@ class WateringAssistant:
         self._water_lock = threading.Lock()
 
     # ---------- 浇水 ----------
-    def water_channel(self, channel_id: int, volume_ml: Optional[int] = None,
+    def water_channel(self, channel_id: int, duration_sec: Optional[int] = None,
                        notify: bool = True) -> Dict[str, Any]:
         ch_cfg = get_channel(self.cfg, channel_id)
         if ch_cfg is None:
             raise ValueError(f"未知通道 {channel_id}")
         with self._water_lock:
-            result = self.pump.water(channel_id, volume_ml)
+            result = self.valve.water(channel_id, duration_sec)
         if notify:
             self.bot.send_text(
-                f"✅ 已为「{result['name']}」浇水 {result['volume_ml']}ml"
-                f"（{result['duration_sec']}s）"
+                f"✅ 已为「{result['name']}」浇水 {result['duration_sec']}s"
             )
         return result
 
@@ -75,11 +74,11 @@ class WateringAssistant:
 
     # ---------- 状态 ----------
     def status_text(self) -> str:
-        rows = ["**🌱 浇花助理状态**", "", "| 通道 | 植物 | 桶 | 上次浇水(ml) | 计划 |", "|---|---|---|---|---|"]
-        for s in self.pump.status():
+        rows = ["**🌱 浇花助理状态**", "", "| 通道 | 植物 | 桶 | 上次浇水(s) | 计划 |", "|---|---|---|---|---|"]
+        for s in self.valve.status():
             rows.append(
                 f"| {s['id']} | {s['name']} | {s['bucket']} | "
-                f"{s['last_volume_ml']} | `{s['schedule_cron'] or '-'}` |"
+                f"{s['last_duration_sec']} | `{s['schedule_cron'] or '-'}` |"
             )
         return "\n".join(rows)
 
@@ -106,10 +105,9 @@ class WateringAssistant:
                 ch = self._resolve_channel(cmd.target or "")
                 if not ch:
                     return f"⚠️ 找不到对应植物或通道：{cmd.target}\n\n{help_text()}"
-                result = self.water_channel(int(ch["id"]), cmd.volume_ml, notify=False)
+                result = self.water_channel(int(ch["id"]), cmd.duration_sec, notify=False)
                 return (
-                    f"✅ 已为「{result['name']}」浇水 {result['volume_ml']}ml "
-                    f"（{result['duration_sec']}s）"
+                    f"✅ 已为「{result['name']}」浇水 {result['duration_sec']}s"
                 )
             return f"❓ 无法识别指令：{cmd.raw}\n\n{help_text()}"
         except Exception as exc:  # noqa: BLE001
@@ -129,5 +127,5 @@ class WateringAssistant:
 
     # ---------- 资源释放 ----------
     def shutdown(self) -> None:
-        self.pump.cleanup()
+        self.valve.cleanup()
         self.camera.close()

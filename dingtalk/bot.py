@@ -33,7 +33,8 @@ class Command:
     raw: str
     action: str           # water / report / photo / status / help
     target: Optional[str] = None
-    volume_ml: Optional[int] = None
+    volume_ml: Optional[int] = None  # 保留兼容旧命令 (已弃用，请用 duration_sec)
+    duration_sec: Optional[int] = None
     sender_id: Optional[str] = None
 
 
@@ -92,8 +93,8 @@ class DingTalkBot:
 # ---------- 指令解析 ----------
 _HELP_TEXT = (
     "🌱 浇花助理指令：\n"
-    "  浇水 <植物类型> [数量ml]   例：浇水 多肉 100\n"
-    "  浇水 通道<1-4> [数量ml]    例：浇水 通道2 150\n"
+    "  浇水 <植物类型> [时长s]     例：浇水 多肉 30\n"
+    "  浇水 通道<1-4> [时长s]      例：浇水 通道2 45\n"
     "  报告                       生成图文生长报告\n"
     "  拍照                       立即拍一张花园照片\n"
     "  状态                       查看 4 路浇水状态\n"
@@ -114,13 +115,13 @@ def parse_command(text: str, sender_id: Optional[str] = None) -> Command:
     if cleaned in ("状态", "status"):
         return Command(raw, "status", sender_id=sender_id)
 
-    m = re.match(r"^(?:浇水|浇)\s*(\S+)\s*(?:(\d+)\s*(?:ml|毫升)?)?$", cleaned)
+    m = re.match(r"^(?:浇水|浇)\s*(\S+)\s*(?:(\d+)\s*(?:s|秒)?)?$", cleaned)
     if m:
         return Command(
             raw=raw,
             action="water",
             target=m.group(1),
-            volume_ml=int(m.group(2)) if m.group(2) else None,
+            duration_sec=int(m.group(2)) if m.group(2) else None,
             sender_id=sender_id,
         )
     return Command(raw, "unknown", sender_id=sender_id)

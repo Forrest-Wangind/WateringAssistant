@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class WaterRequest(BaseModel):
     channel_id: int
-    volume_ml: Optional[int] = None
+    duration_sec: Optional[int] = None
 
 
 def create_app(assistant: WateringAssistant) -> FastAPI:
@@ -26,12 +26,12 @@ def create_app(assistant: WateringAssistant) -> FastAPI:
 
     @app.get("/api/status")
     def status():
-        return {"channels": assistant.pump.status()}
+        return {"channels": assistant.valve.status()}
 
     @app.post("/api/water")
     def water(req: WaterRequest):
         try:
-            return assistant.water_channel(req.channel_id, req.volume_ml, notify=False)
+            return assistant.water_channel(req.channel_id, req.duration_sec, notify=False)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -33,11 +33,11 @@ def test_api_water(mock_config: Dict[str, Any], mock_env):
     assistant = WateringAssistant(mock_config)
     app = create_app(assistant)
     client = TestClient(app)
-    r = client.post("/api/water", json={"channel_id": 2, "volume_ml": 200})
+    r = client.post("/api/water", json={"channel_id": 2, "duration_sec": 10})
     assert r.status_code == 200
     data = r.json()
     assert data["channel_id"] == 2
-    assert data["volume_ml"] == 200
+    assert data["duration_sec"] == 10
     assistant.shutdown()
 
 

@@ -40,24 +40,24 @@ def test_parse_command_water_by_name():
     cmd = parse_command("浇水 多肉")
     assert cmd.action == "water"
     assert cmd.target == "多肉"
-    assert cmd.volume_ml is None
+    assert cmd.duration_sec is None
 
     cmd = parse_command("浇 热带植物 500")
     assert cmd.action == "water"
     assert cmd.target == "热带植物"
-    assert cmd.volume_ml == 500
+    assert cmd.duration_sec == 500
 
 
 def test_parse_command_water_by_channel():
     cmd = parse_command("浇水 通道2 150")
     assert cmd.action == "water"
     assert cmd.target == "通道2"
-    assert cmd.volume_ml == 150
+    assert cmd.duration_sec == 150
 
     cmd = parse_command("浇水 通道3")
     assert cmd.action == "water"
     assert cmd.target == "通道3"
-    assert cmd.volume_ml is None
+    assert cmd.duration_sec is None
 
 
 def test_parse_command_with_at():
@@ -65,7 +65,7 @@ def test_parse_command_with_at():
     cmd = parse_command("@浇花助理 浇水 多肉 100")
     assert cmd.action == "water"
     assert cmd.target == "多肉"
-    assert cmd.volume_ml == 100
+    assert cmd.duration_sec == 100
 
 
 def test_parse_command_unknown():

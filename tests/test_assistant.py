@@ -8,7 +8,7 @@ from assistant import WateringAssistant
 
 def test_assistant_init(mock_config: Dict[str, Any], mock_env):
     assistant = WateringAssistant(mock_config)
-    assert assistant.pump is not None
+    assert assistant.valve is not None
     assert assistant.camera is not None
     assert assistant.analyzer is not None
     assert assistant.bot is not None
@@ -56,10 +56,10 @@ def test_handle_command_water_by_name(mock_config: Dict[str, Any], mock_env):
 
 def test_handle_command_water_by_channel(mock_config: Dict[str, Any], mock_env):
     assistant = WateringAssistant(mock_config)
-    reply = assistant.handle_command("浇水 通道3 600")
+    reply = assistant.handle_command("浇水 通道3 30")
     assert "已为" in reply
     assert "中生植物" in reply
-    assert "600ml" in reply
+    assert "30.0s" in reply
     assistant.shutdown()
 
 
@@ -92,9 +92,9 @@ def test_handle_command_whitelist(mock_config: Dict[str, Any], mock_env):
 def test_water_channel_direct(mock_config: Dict[str, Any], mock_env):
     """直接调用 water_channel。"""
     assistant = WateringAssistant(mock_config)
-    result = assistant.water_channel(1, volume_ml=300, notify=False)
+    result = assistant.water_channel(1, duration_sec=30, notify=False)
     assert result["channel_id"] == 1
-    assert result["volume_ml"] == 300
+    assert result["duration_sec"] == 30
     assistant.shutdown()
 
 
