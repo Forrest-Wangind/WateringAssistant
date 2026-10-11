@@ -1,6 +1,8 @@
 RPi.GPIO==0.7.1; platform_machine == "armv7l" or platform_machine == "aarch64"
 gpiozero==2.0
-picamera2==0.3.18; platform_machine == "aarch64"
+# picamera2 + libcamera 只能通过 apt 安装（非 PyPI），Raspberry Pi OS 上执行：
+#   sudo apt install -y python3-libcamera python3-picamera2
+# 之后用 --system-site-packages 创建 venv，或参考 .venv 中的 system_packages.pth 暴露系统包。
 APScheduler==3.10.4
 fastapi==0.110.0
 uvicorn[standard]==0.29.0
