@@ -50,7 +50,7 @@ def main() -> int:
         water_fn=lambda cid: _safe_run(lambda: assistant.water_channel(cid, notify=True)),
     )
     scheduler.schedule_daily_report(
-        hour=18, minute=0,
+        hour=13, minute=0,
         report_fn=lambda: _safe_run(lambda: assistant.take_photo_and_report(push=True)),
     )
     scheduler.start()

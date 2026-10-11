@@ -17,6 +17,12 @@
 - venv 必须用 `python3 -m venv --system-site-packages .venv` 创建，否则 venv 看不到这些包（这是"拍照一直是 mock"的头号原因）。
 - 用户需加入 `video`、`gpio` 组；`config.txt` 需 `camera_auto_detect=1` 且不能有 legacy `start_x=1`。
 
+## 定时浇水配置（config.yaml）
+- 计划浇水时长**只由** `channels[].default_duration_sec` 决定：`main.py` 注册的是 `assistant.water_channel(cid, notify=True)`，`duration_sec=None` → `ValveController.water()` 回落到 `default_duration_sec`。改计划时长不必动 safety。
+- `schedule_cron` 用 5 段标准 crontab，但经 APScheduler `CronTrigger.from_crontab` 解析，**星期字段 0=周一**（与常规 crontab 的 0=周日相反），`7` 会抛 ValueError。**星期一律写英文名 `mon`..`sun`**，避免语义歧义。
+- 单位换算：crontab 的 day-of-month 段写 `*/n` 表示"每 n 天"（如 `0 8 */7 * *`）。
+- 已知隐患：`scheduler/watering_scheduler.py::schedule_channels` 里 cron 解析失败只 `logger.error` + `continue`，任务不注册而进程照常启动 —— 与"绝不静默失败"原则冲突，配置写错会变成静默不浇水。
+
 ## 其他
 - 运行测试用项目内 venv：`.venv/bin/python -m pytest`（全量约 3 分钟，慢在真实 `time.sleep`）；
   单文件也可直接 `.venv/bin/python tests/test_camera.py`（依赖 `tests/_bootstrap.py` + `pytest.ini` 的 `pythonpath`，勿删）。
