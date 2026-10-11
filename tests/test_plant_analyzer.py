@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import _bootstrap  # noqa: F401  必须在导入项目模块之前执行：把仓库根目录加入 sys.path
 from ai.plant_analyzer import PlantAnalyzer
 from hardware.camera import Camera
 
@@ -67,3 +68,7 @@ def test_analyzer_with_mocked_anthropic(mock_config: Dict[str, Any], temp_dirs: 
     content = call_kwargs["messages"][0]["content"]
     assert any(c["type"] == "image" for c in content)
     assert any(c["type"] == "text" for c in content)
+
+
+if __name__ == "__main__":
+    _bootstrap.run(__file__)

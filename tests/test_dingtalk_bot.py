@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import _bootstrap  # noqa: F401  必须在导入项目模块之前执行：把仓库根目录加入 sys.path
 from dingtalk.bot import (
     Command,
     DingTalkBot,
@@ -159,3 +160,7 @@ def test_chatbot_handler_catches_exception():
     reply_text = handler.reply_markdown.call_args[0][1]
     assert "❌" in reply_text
     assert "boom" in reply_text
+
+
+if __name__ == "__main__":
+    _bootstrap.run(__file__)

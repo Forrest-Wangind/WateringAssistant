@@ -3,6 +3,7 @@ from typing import Any, Dict
 
 from fastapi.testclient import TestClient
 
+import _bootstrap  # noqa: F401  必须在导入项目模块之前执行：把仓库根目录加入 sys.path
 from assistant import WateringAssistant
 from web.server import create_app
 
@@ -74,3 +75,7 @@ def test_api_photo(mock_config: Dict[str, Any], mock_env):
     data = r.json()
     assert "photo" in data
     assistant.shutdown()
+
+
+if __name__ == "__main__":
+    _bootstrap.run(__file__)

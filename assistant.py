@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import replace
 from typing import Any, Dict, Optional
 
 from ai.plant_analyzer import AnalysisReport, PlantAnalyzer
 from dingtalk.bot import Command, DingTalkBot, help_text, parse_command
-from hardware.camera import Camera
+from hardware.camera import Camera, CameraError
 from hardware.valve_controller import ValveController
 from utils import find_channel_by_name, get_channel
 
@@ -26,12 +27,16 @@ class WateringAssistant:
             max_single_run_sec=int(safety.get("max_single_run_sec", 180)),
             cooldown_sec=int(safety.get("cooldown_sec", 30)),
             global_lock=bool(safety.get("global_lock", True)),
+            # 默认不允许静默降级：GPIO 不可用直接抛 HardwareError
+            allow_mock_fallback=bool(safety.get("allow_mock_fallback", False)),
         )
         self.camera = Camera(
             photo_dir=sys_cfg.get("photo_dir", "./data/photos"),
             resolution=tuple(cfg.get("camera", {}).get("resolution", (1920, 1080))),
             warmup_sec=float(cfg.get("camera", {}).get("warmup_sec", 2.0)),
             mock=bool(sys_cfg.get("mock_hardware", False)),
+            # 默认不允许静默降级：mock_hardware=false 时相机不可用直接抛 CameraError
+            allow_mock_fallback=bool(cfg.get("camera", {}).get("allow_mock_fallback", False)),
         )
         self.analyzer = PlantAnalyzer(
             ai_cfg=cfg.get("ai", {}),
@@ -57,9 +62,12 @@ class WateringAssistant:
     # ---------- 报告 ----------
     def take_photo_and_report(self, push: bool = True) -> AnalysisReport:
         photo = self.camera.capture("garden")
+        mock_banner = self._mock_banner()
         if push:
-            self.bot.send_text(f"📷 已拍摄花园照片: {photo.name}，正在分析…")
+            self.bot.send_text(f"📷 已拍摄花园照片: {photo.name}，正在分析…{mock_banner}")
         report = self.analyzer.analyze(photo)
+        if mock_banner:
+            report = replace(report, markdown=mock_banner.strip() + "\n\n" + report.markdown)
         if push:
             title = "🌿 花园生长报告"
             score = f"  健康评分 {report.score}/5" if report.score else ""
@@ -69,12 +77,29 @@ class WateringAssistant:
     def take_photo_only(self, push: bool = True) -> str:
         photo = self.camera.capture("garden")
         if push:
-            self.bot.send_text(f"📷 已拍照: {photo.resolve()}")
+            self.bot.send_text(f"📷 已拍照: {photo.resolve()}{self._mock_banner()}")
         return str(photo.resolve())
+
+    def _mock_banner(self) -> str:
+        """相机处于 mock 模式时返回醒目提示（含分类原因），否则返回空串。"""
+        if not self.camera.is_mock:
+            return ""
+        return (
+            f"\n⚠️ [MOCK] 当前未使用真实相机，生成的是占位图，报告内容不可信"
+            f"（原因分类: {self.camera.error_kind or 'mock_hardware=true'}；"
+            f"详见日志或运行 `python tools/camera_diag.py`）"
+        )
 
     # ---------- 状态 ----------
     def status_text(self) -> str:
-        rows = ["**🌱 浇花助理状态**", "", "| 通道 | 植物 | 桶 | 上次浇水(s) | 计划 |", "|---|---|---|---|---|"]
+        cam = self.camera.status()
+        cam_line = (
+            f"**📷 相机**: {'⚠️ MOCK 占位图' if cam['is_mock'] else '✅ ' + cam['mode']}"
+            f" {cam['resolution']}"
+        )
+        if cam["is_mock"] and cam["error_kind"]:
+            cam_line += f"（[{cam['error_kind']}] {cam['mock_reason']}）"
+        rows = ["**🌱 浇花助理状态**", "", cam_line, "", "| 通道 | 植物 | 桶 | 上次浇水(s) | 计划 |", "|---|---|---|---|---|"]
         for s in self.valve.status():
             rows.append(
                 f"| {s['id']} | {s['name']} | {s['bucket']} | "
@@ -96,7 +121,7 @@ class WateringAssistant:
                 return self.status_text()
             if cmd.action == "photo":
                 path = self.take_photo_only(push=False)
-                return f"📷 已拍照: {path}"
+                return f"📷 已拍照: {path}{self._mock_banner()}"
             if cmd.action == "report":
                 report = self.take_photo_and_report(push=False)
                 score = f"  健康评分 {report.score}/5" if report.score else ""
@@ -110,6 +135,10 @@ class WateringAssistant:
                     f"✅ 已为「{result['name']}」浇水 {result['duration_sec']}s"
                 )
             return f"❓ 无法识别指令：{cmd.raw}\n\n{help_text()}"
+        except CameraError as exc:
+            # 相机类故障：显式分类 + 修复建议，绝不静默出占位图
+            logger.error("相机故障 [%s]: %s", exc.kind, exc)
+            return f"❌ 相机不可用 [{exc.kind}]：{exc}\n💡 {exc.hint}"
         except Exception as exc:  # noqa: BLE001
             logger.exception("指令执行失败")
             return f"❌ 执行失败：{exc}"

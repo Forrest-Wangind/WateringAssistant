@@ -52,13 +52,19 @@ WateringAssistant/
 
 ```bash
 git clone <repo> && cd WateringAssistant
-python3 -m venv .venv && source .venv/bin/activate
+# 树莓派上必须带 --system-site-packages，否则 venv 看不到 apt 装的 picamera2 / libcamera
+python3 -m venv --system-site-packages .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
+# 树莓派额外装相机与 GPIO 后端（apt 提供，pip 装不全）
+sudo apt install -y python3-picamera2 python3-libcamera python3-gpiod
+sudo usermod -aG video,gpio $USER   # 重新登录生效
+
 cp .env.example .env             # 填入 ANTHROPIC_API_KEY 与 DINGTALK_*
 ```
 
-* 在树莓派上把 `config.yaml` 中 `mock_hardware` 改为 `false`；
-* 在 PC / Mac 上保持 `true`，硬件操作会走 mock。
+* 在树莓派上保持 `system.mock_hardware: false`（使用真实相机与 GPIO，硬件缺失会直接报错）；
+* 在 PC / Mac 上改为 `true`，硬件操作才走 mock。
 
 ## 运行
 
@@ -106,11 +112,86 @@ python main.py
 * **全局互锁**：同一时刻仅允许一路水泵运行；
 * **GPIO 初始置高**：低电平触发的继电器开机即关闭，断电也关。
 
+## 测试
+
+统一使用项目内虚拟环境（`.venv`）运行：
+
+```bash
+.venv/bin/python -m pytest                       # 全量（约 3 分钟，慢在用例里的真实 sleep）
+.venv/bin/python -m pytest tests/test_camera.py -v   # 单个文件
+.venv/bin/python tests/test_camera.py            # 也可以直接执行单个测试文件
+```
+
+> **不要用 `python tests/test_camera.py` 之外的解释器**：`python` 若指向系统/其他解释器，
+> 会缺 pytest 与项目依赖。请用 `.venv/bin/python`，或先 `source .venv/bin/activate`。
+>
+> `pytest.ini` 已配置 `pythonpath = . tests`，配合各测试文件顶部的
+> `import _bootstrap`，无论从哪个工作目录调用、或用 IDE 的「Run File」都能正确导入项目模块。
+
+`tests/testRelay.py` 是**手动硬件脚本**（继电器点动），不参与自动测试；它在树莓派上单独执行：
+
+```bash
+.venv/bin/python tests/testRelay.py    # 仅树莓派，Ctrl-C 退出
+```
+
+## 硬件降级策略（重要）
+
+本项目**不做静默降级**。`mock_hardware: false`（树莓派）时，若相机或 GPIO 不可用，
+程序会直接抛出带分类原因的 `HardwareError` 并拒绝继续，而不是悄悄生成占位图 / 假装浇水成功。
+
+| 配置 | 默认 | 含义 |
+|---|---|---|
+| `system.mock_hardware` | `false` | `true` 时全部走模拟（PC/Mac 开发）；`false` 时使用真实硬件 |
+| `camera.allow_mock_fallback` | `false` | 仅在"无相机也要跑通流程"时才设 `true`；此时照片名带 `MOCK_` 前缀且日志为 WARNING |
+| `safety.allow_mock_fallback` | `false` | 同上，作用于 GPIO；为 `true` 时浇水不会真正开阀，日志会明确告警 |
+
+异常按三类归档，便于快速定位：
+
+* `not_found`：模块/设备不存在（picamera2 未装、libcamera 未检测到相机、GPIO 后端未装）
+* `unreachable`：设备存在但拿不到（被占用、权限不足、超时）
+* `unknown`：未归类，日志里有完整堆栈
+
+## 相机诊断
+
+拍照结果是绿色 "MOCK GARDEN PHOTO" 占位图时，在树莓派上运行：
+
+```bash
+python tools/camera_diag.py          # 环境自检（不动相机）
+python tools/camera_diag.py --live   # 额外做一次真实打开 + 拍照
+```
+
+脚本会输出：解释器是否在 venv、`picamera2`/`libcamera` 是否可见、`/dev/video*`、
+当前用户是否在 `video` 组、`config.txt` 的相机配置，并给出**分类结论 + 修复建议**。
+
+最常见的两个原因：
+
+1. **venv 看不到 apt 安装的 picamera2**：`picamera2` 来自 `apt install python3-picamera2`，
+   装在 `/usr/lib/python3/dist-packages`。用 `python3 -m venv .venv`（不带参数）创建的 venv
+   **默认隔离系统包**，于是 `import picamera2` 失败。解决：
+
+   ```bash
+   rm -rf .venv && python3 -m venv --system-site-packages .venv
+   source .venv/bin/activate && pip install -r requirements.txt
+   # 或直接用系统解释器运行：/usr/bin/python3 main.py
+   ```
+
+2. **相机未被 libcamera 识别**：先用系统工具确认硬件层是否可见：
+
+   ```bash
+   rpicam-hello --list-cameras   # 旧系统用 libcamera-hello --list-cameras
+   ```
+
+   完全没输出 → 检查 FPC 排线方向/插紧（Pi 5 排线朝向与 Pi 4 不同），
+   确认 `/boot/firmware/config.txt` 中 `camera_auto_detect=1` 且**没有** `start_x=1`（legacy 栈冲突），改完重启。
+
 ## 常见问题
 
-* **`picamera2` 装不上？** 仅在树莓派 64-bit OS 上可用；其他环境保持 `mock_hardware: true` 即可。
+* **`picamera2` 装不上？** 仅在树莓派 64-bit OS 上可用；其他环境把 `system.mock_hardware` 设为 `true`。
+* **拍照出来是绿色 MOCK 图？** 说明相机初始化失败被降级了。运行 `python tools/camera_diag.py` 定位；
+  升级后默认不会再静默降级，会直接报错并给出 `kind` 与修复建议。
 * **钉钉收不到 @ 消息？** 检查 `DINGTALK_CLIENT_ID/SECRET` 是否正确、应用版本是否已发布、机器人是否加进群；启动日志里应有「钉钉 Stream 客户端已启动」。
 * **水泵不出水？** 先在 `/api/water` 单独触发，并听继电器是否吸合；不吸合多半是 BCM 编号或 12V 电源未接通。
+* **启动即报 `HardwareError`？** 这是预期行为（fail-fast）。修好硬件，或在开发机上把 `mock_hardware` 设为 `true`。
 
 ## 许可证
 

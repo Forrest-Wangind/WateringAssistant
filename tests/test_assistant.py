@@ -3,6 +3,7 @@ from typing import Any, Dict
 
 import pytest
 
+import _bootstrap  # noqa: F401  必须在导入项目模块之前执行：把仓库根目录加入 sys.path
 from assistant import WateringAssistant
 
 
@@ -105,3 +106,7 @@ def test_take_photo_and_report(mock_config: Dict[str, Any], mock_env):
     assert report.report_path.exists()
     assert report.score is not None
     assistant.shutdown()
+
+
+if __name__ == "__main__":
+    _bootstrap.run(__file__)

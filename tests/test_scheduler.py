@@ -2,6 +2,7 @@
 import time
 from typing import Any, Dict
 
+import _bootstrap  # noqa: F401  必须在导入项目模块之前执行：把仓库根目录加入 sys.path
 from scheduler.watering_scheduler import WateringScheduler
 
 
@@ -57,3 +58,7 @@ def test_scheduler_invalid_cron(mock_config: Dict[str, Any]):
     jobs = sched.jobs_info()
     assert len(jobs) == 0  # 解析失败，未注册
     sched.shutdown()
+
+
+if __name__ == "__main__":
+    _bootstrap.run(__file__)
