@@ -80,18 +80,62 @@ def test_help_text():
     assert "状态" in txt
 
 
-def test_bot_send_text_mock(mock_config: Dict[str, Any], mock_env):
-    """无 webhook 时走 mock 打印。"""
+def test_bot_no_channel_reports_error(mock_config: Dict[str, Any], mock_env):
+    """没有任何推送通道时必须**显式失败**，不能假装发送成功。
+
+    这是项目「绝不静默失败」原则的直接体现：以前无 webhook 时只打一行日志，
+    调用方以为推成功了，实际用户什么都没收到。
+    """
     bot = DingTalkBot(mock_config["dingtalk"])
+    assert bot.channel == "none"
+
     result = bot.send_text("测试消息")
-    assert result["errcode"] == 0
-    assert result["errmsg"] == "mock"
+    assert result["ok"] is False
+    assert result["error_kind"] == "not_configured"
+    assert "DINGTALK_CLIENT_ID" in result["hint"] or "webhook" in result["hint"].lower()
 
-
-def test_bot_send_markdown_mock(mock_config: Dict[str, Any], mock_env):
-    bot = DingTalkBot(mock_config["dingtalk"])
     result = bot.send_markdown("标题", "# Markdown 内容")
-    assert result["errcode"] == 0
+    assert result["ok"] is False
+    assert result["error_kind"] == "not_configured"
+
+
+def test_bot_mock_fallback_only_when_allowed(mock_config: Dict[str, Any], mock_env):
+    """本地开发（mock_hardware=true）才允许降级为本地打印。"""
+    bot = DingTalkBot(mock_config["dingtalk"], allow_mock_fallback=True)
+    result = bot.send_text("测试消息")
+    assert result["ok"] is True
+    assert result["mock"] is True
+
+
+def test_bot_channel_prefers_robot(mock_config: Dict[str, Any], mock_env, monkeypatch):
+    """同时配了机器人凭证和 webhook 时，优先用机器人通道（只有它能发本地图片）。"""
+    monkeypatch.setenv("DINGTALK_WEBHOOK", "https://oapi.dingtalk.com/robot/send?access_token=abc")
+    monkeypatch.setenv("DINGTALK_CLIENT_ID", "cid")
+    monkeypatch.setenv("DINGTALK_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("DINGTALK_ROBOT_CODE", "rcode")
+    bot = DingTalkBot(mock_config["dingtalk"])
+    assert bot.channel == "robot"
+
+
+def test_bot_send_image_without_public_url(mock_config: Dict[str, Any], mock_env, monkeypatch, tmp_path):
+    """webhook 通道无法推送本地图片，必须给出明确原因而不是静默丢弃。"""
+    monkeypatch.setenv("DINGTALK_WEBHOOK", "https://oapi.dingtalk.com/robot/send?access_token=abc")
+    bot = DingTalkBot(mock_config["dingtalk"])
+    assert bot.channel == "webhook"
+
+    img = tmp_path / "a.jpg"
+    img.write_bytes(b"\xff\xd8\xff")
+    result = bot.send_image(img)
+    assert result["ok"] is False
+    assert result["error_kind"] == "no_public_url"
+
+
+def test_bot_recipients_from_subscribers(mock_config: Dict[str, Any], mock_env):
+    bot = DingTalkBot(mock_config["dingtalk"])
+    assert bot.recipients() == []
+    assert bot.subscribers.add("user_1") is True
+    assert bot.recipients() == ["user_1"]
+    assert bot.delivery_status()["recipients"] == ["user_1"]
 
 
 def test_bot_signed_url(mock_config: Dict[str, Any], monkeypatch):

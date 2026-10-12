@@ -9,8 +9,9 @@
   * 拍照使用真实摄像头（配置 mock_hardware=false 时）。
   * 拍照会先触发一次自动对焦（config.yaml 的 camera.autofocus），再限制曝光上限，
     最后对成片做清晰度体检 —— 结果会打印在下方，并在异常时给出处置建议。
-  * 分析需要 ANTHROPIC_API_KEY（见 config.yaml 的 ai.api_key_env）；
-    未设置时返回占位报告，不会真正分析照片。
+  * 分析走 config.yaml 的 ai 段（provider 可为 deepseek / anthropic / openai 等），
+    API Key 由 ai.api_key_env 指定。**缺 Key 或调用失败会显式报错并返回退出码 1**，
+    不会悄悄给出一份占位报告（除非显式打开 ai.allow_mock_fallback）。
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from pathlib import Path
 # 允许直接以 `python tests/photoAndAnalyse.py` 运行（把项目根目录加入 sys.path）
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ai.errors import AIError  # noqa: E402
 from ai.plant_analyzer import PlantAnalyzer  # noqa: E402
 from hardware.camera import Camera, assess_image, judge_quality, summarize_metadata  # noqa: E402
 from utils import load_config  # noqa: E402
@@ -83,10 +85,30 @@ def take_photo_and_analyse(verbose: bool = False) -> int:
     _report_quality(cam, photo, verbose)
     cam.close()
 
-    report = PlantAnalyzer(cfg["ai"], cfg["system"]["report_dir"]).analyze(photo)
+    ai_cfg = cfg.get("ai", {})
+    analyzer = PlantAnalyzer(
+        ai_cfg,
+        cfg["system"]["report_dir"],
+        allow_mock_fallback=bool(ai_cfg.get("allow_mock_fallback", False)),
+    )
+    info = analyzer.describe()
+    print("-" * 62)
+    print(f"AI 配置  : provider={info['provider']} / model={info['model']}"
+          f" / 视觉={'是' if info['supports_vision'] else '否'}")
+
+    try:
+        report = analyzer.analyze(photo)
+    except AIError as exc:
+        print(f"❌ AI 分析失败 [{exc.kind}]：{exc}")
+        print(f"💡 {exc.hint}")
+        print("   （这是显式失败，不是占位报告；修复后重跑）")
+        return 1
+
     print("PHOTO :", photo)
     print("REPORT:", report.report_path)
     print("SCORE :", report.score)
+    if report.degraded:
+        print("⚠️ 本次为 MOCK 占位报告，内容不可信 ——", report.degraded_reason)
     print("------")
     print(report.markdown)
     return 0

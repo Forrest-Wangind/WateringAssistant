@@ -83,11 +83,51 @@ camera:
     min_sharpness: 8.0
     min_contrast: 12.0
 
+# ---- AI 多模态分析（可切换供应商）----
+# 换模型只改这一段，不用动代码。支持任意 OpenAI / Anthropic 兼容端点。
+# 详细配置与各厂商示例见 docs/ai_providers.md；自检用 `python tools/ai_diag.py`。
 ai:
-  provider: anthropic
-  model: claude-opus-4-7
-  api_key_env: ANTHROPIC_API_KEY
+  # 内置可选：deepseek | anthropic | openai | openai_compatible | ollama | mock
+  #   通义 / Moonshot / 智谱 / 自建网关 等一律用 openai_compatible，再填 base_url。
+  provider: deepseek
+  # 留空则用该 provider 的默认模型。**建议显式写明** —— 模型名会随厂商迭代变化。
+  #   DeepSeek 只有 deepseek-flash 支持图片；deepseek-v4-pro 是纯文本（发图会被静默丢弃）。
+  model: deepseek-flash
+  # 读取 API Key 的环境变量名（值写在 .env 里，勿写进本文件）
+  api_key_env: DEEPSEEK_API_KEY
+  # 自定义端点，留空用 provider 默认值（deepseek / anthropic / openai 都不需要填）。
+  #   Moonshot : https://api.moonshot.cn/v1
+  #   通义     : https://dashscope.aliyuncs.com/compatible-mode/v1
+  #   DeepSeek 的 Anthropic 兼容端点: https://api.deepseek.com/anthropic
+  base_url: null
+
+  # 模型是否有视觉能力。**留空即由内置预设自动判定**（deepseek 按模型白名单）。
+  # 之所以要这个开关：纯文本模型收到图片通常**不报错**，只会把图片换成占位文字，
+  # 然后凭空编造一份看着很正常的花园分析。判定为 false 时程序会直接拒绝发送照片。
+  supports_vision: null
+
   max_tokens: 1500
+  # DeepSeek 等开启思考模式的模型不支持 temperature（传了也不报错、也不生效），
+  # 默认不传；需要时再填 0~1 的值。
+  temperature: null
+  timeout_sec: 60
+  # 图片细节级别（仅 OpenAI 兼容端点生效）：
+  #   high = 保留原图（默认，能看清叶片细节）；low = 缩到 512×512，更快更省 token。
+  image_detail: high
+
+  # 厂商私有参数，原样并入请求体（不同厂商的扩展字段放这里）。
+  # 示例 —— 关闭 DeepSeek 思考模式：思考默认开启且会占用大量输出 token，
+  # 对"看图写报告"这类任务没必要，关掉可显著降低延迟与 token 消耗。
+  # extra_body:
+  #   thinking:
+  #     type: disabled
+
+  # 仅当"没有 AI Key 也要跑通全流程"时才设为 true。
+  # false（推荐）：缺 Key / 调用失败时抛 AIError，绝不拿占位报告冒充真实分析。
+  allow_mock_fallback: false
+
+  system_prompt: |
+    你是一名严谨的园艺师，只依据画面中可见的信息作答，不要编造看不到的细节。
   prompt: |
     你是一名资深园艺师。请基于这张花园照片，分析画面中可见盆栽的整体生长状况，
     分别从下列维度给出图文报告：
@@ -98,14 +138,45 @@ ai:
     使用 Markdown，简洁分点，并在结尾给出 1-5 分的综合健康评分。
 
 dingtalk:
-  # 自定义机器人，用于主动推送（图片 / 报告 / 状态）
+  # ---- 通道一：企业内部机器人单聊（推荐，唯一能在无公网环境发照片的通道）----
+  # 照片走 media/upload 拿 mediaId，再作为 sampleImageMsg 的 photoURL 发送，
+  # 全程只需要 accessToken，不依赖公网 IP、不需要图床、不需要 AgentId。
+  # 前置条件：开发者后台申请「企业内机器人发送消息权限」+ 应用已发布。
+  client_id_env: DINGTALK_CLIENT_ID          # 企业内部应用 Client ID（=AppKey）
+  client_secret_env: DINGTALK_CLIENT_SECRET  # 企业内部应用 Client Secret（=AppSecret）
+  robot_code_env: DINGTALK_ROBOT_CODE        # 机器人编码（机器人 ID）
+
+  # 主动推送的目标 userId。**留空即可**：你在钉钉里给机器人发一条消息后，
+  # 程序会把你的 userId 自动记录到下面的文件，之后每日推送即可送达。
+  # （钉钉不允许机器人凭空发起单聊，用户必须先和机器人说过话。）
+  user_ids: []
+  subscribers_file: ./data/subscribers.json
+
+  # ---- 通道二：自定义机器人 webhook（只能发群；图片必须公网可访问）----
+  # 家庭内网无公网 IP 时，这里配了也发不出图片，故默认留空。
   webhook_env: DINGTALK_WEBHOOK
   secret_env: DINGTALK_SECRET
+  # 若把照片放到公网（对象存储/反代），在此填 URL 前缀，webhook 通道才能引用
+  image_public_base_url: ""
+
+  # 单次请求超时（秒）与 markdown 内容上限（超出会截断，钉钉对过长内容直接拒收）
+  push_timeout_sec: 15
+  max_markdown_chars: 3500
+
   # Stream 模式接收 @机器人 消息（无需公网回调）
-  client_id_env: DINGTALK_CLIENT_ID
-  client_secret_env: DINGTALK_CLIENT_SECRET
+  # 注：与上面的 Client ID/Secret 是同一对企业应用凭证，不需要重复配置
   # 仅允许下列 userId / unionId 下发浇花指令
   allowed_users: []
+
+# 每日照片 + 报告推送
+push:
+  enabled: true
+  # 是否推送照片（false = 只推文字报告）
+  send_photo: true
+  # 每日推送时间（服务器时区见 system.timezone）
+  daily_report:
+    hour: 13
+    minute: 0
 
 web:
   host: 0.0.0.0

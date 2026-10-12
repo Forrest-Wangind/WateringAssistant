@@ -4,7 +4,7 @@
 
 * **4 路独立水泵**：分别为热带 / 多肉 / 中生 / 水生植物供水；
 * **定时 + 远程**：APScheduler 按需触发，钉钉群里发指令也能控制；
-* **AI 生长报告**：摄像头拍照后调用 Claude 视觉模型，生成 Markdown 图文报告；
+* **AI 生长报告**：摄像头拍照后交给可配置的多模态大模型（DeepSeek / Claude / OpenAI / 通义…），生成 Markdown 图文报告；
 * **钉钉双向通信**：自定义机器人推送图片 / 报告，outgoing 机器人接收用户指令；
 * **铝型材花架**：3 层结构，30 盆容量，集水槽收集渗水至下水道。
 
@@ -24,7 +24,7 @@
               定时触发 ▼                                    ▼
         ┌──────────────┐  GPIO  ┌─────────┐   ┌────────────────┐
         │ APScheduler  │ ─────▶ │ 4路水泵 │   │ Pi Camera +    │
-        └──────────────┘        └─────────┘   │ Claude Vision  │
+        └──────────────┘        └─────────┘   │ 多模态大模型    │
                                               └────────────────┘
 ```
 
@@ -41,11 +41,18 @@ WateringAssistant/
 ├── hardware/
 │   ├── pump_controller.py        # 4 路 GPIO 水泵
 │   └── camera.py                 # picamera2 / mock
-├── ai/plant_analyzer.py          # Claude 多模态报告
+├── ai/
+│   ├── providers.py              # 可插拔大模型适配（DeepSeek/Claude/OpenAI/…）
+│   ├── plant_analyzer.py         # 照片 → 生长报告
+│   └── errors.py                 # AIError（分类 + 修复建议）
 ├── dingtalk/bot.py               # webhook 推送 + Stream 接收 + 指令解析
 ├── scheduler/watering_scheduler.py
 ├── web/server.py                 # FastAPI: /api/water /api/report
-└── docs/hardware_design.md       # 花架与水路设计
+└── docs/
+    ├── hardware_design.md        # 花架与水路设计
+    ├── camera_image_quality.md   # 拍照模糊的成因与处置
+    ├── dingtalk_push.md          # 每日照片/报告推送
+    └── ai_providers.md           # 多模型配置与排障
 ```
 
 ## 安装
@@ -60,7 +67,7 @@ pip install -r requirements.txt
 sudo apt install -y python3-picamera2 python3-libcamera python3-gpiod
 sudo usermod -aG video,gpio $USER   # 重新登录生效
 
-cp .env.example .env             # 填入 ANTHROPIC_API_KEY 与 DINGTALK_*
+cp .env.example .env             # 填入 AI 模型 Key（如 DEEPSEEK_API_KEY）与 DINGTALK_*
 ```
 
 * 在树莓派上保持 `system.mock_hardware: false`（使用真实相机与 GPIO，硬件缺失会直接报错）；
@@ -79,31 +86,86 @@ python main.py
 * `POST /api/report` 立即拍照 + AI 报告；
 * 钉钉群里 @机器人 或发关键词消息（通过 Stream 长连接接收，无需公网回调）。
 
+## AI 模型配置（可换模型）
+
+报告生成不绑定任何一家大模型，换模型只改 `config.yaml` 的 `ai:` 段。默认用 DeepSeek：
+
+```yaml
+ai:
+  provider: deepseek          # deepseek | anthropic | openai | openai_compatible | ollama | mock
+  model: deepseek-flash       # DeepSeek 只有 flash 能看图；v4-pro 是纯文本
+  api_key_env: DEEPSEEK_API_KEY
+```
+
+换成 Claude / OpenAI / 通义 / 本地 Ollama：改 `provider` + `model` + `api_key_env`
+（非内置厂商用 `provider: openai_compatible` + `base_url`）。
+
+```bash
+python tools/ai_diag.py           # 自检：配置 / Key / 模型视觉能力（不联网、不花钱）
+python tools/ai_diag.py --live    # 额外真实调用一次，确认链路通
+```
+
+> ⚠️ **必须用带视觉能力的模型**。纯文本模型收到图片**不会报错**，只会把图片丢掉后
+> **编造**一份看起来正常的分析。本项目会在发送前判定并直接拒绝，绝不产生假报告。
+
+完整 provider 对照表、各厂商配置示例与排障分诊见 [`docs/ai_providers.md`](docs/ai_providers.md)。
+
 ## 钉钉配置
 
-钉钉指令接收使用 **Stream 模式**（长连接），无需公网穿透：
+### 推送通道怎么选（重点）
 
-1. 群设置 → 智能群助手 → **添加自定义机器人（推送）**
-   * 安全设置选「加签」，把 webhook 与签名分别填入 `.env` 的 `DINGTALK_WEBHOOK` / `DINGTALK_SECRET`，用于推送图片/报告/状态；
-2. [钉钉开放平台](https://open-dev.dingtalk.com/) → 应用开发 → **创建企业内部应用**
-   * 在「凭证与基础信息」拿到 `AppKey` / `AppSecret`，分别填入 `.env` 的 `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET`；
-   * 「机器人」页签开启机器人能力并发布；
-   * 「事件订阅」选 **Stream 模式**（默认即可，不用配公网回调地址）；
-   * 把机器人加入目标群聊；
-3. （可选）`config.yaml` 的 `dingtalk.allowed_users` 加白名单 userId。
+| 通道 | 能发照片？ | 依赖 | 适用 |
+|---|---|---|---|
+| **企业机器人单聊**（推荐） | ✅ 上传图片拿 `mediaId`，直接作为图片消息发出 | 只需企业应用凭证，**不需要公网 IP** | 家庭内网部署（本项目） |
+| 自定义机器人 webhook | ⚠️ 只能发群；图片必须是**公网可访问**的 URL | webhook 地址 | 有公网域名的场景 |
 
-> 实现参考 [open-dingtalk/dingtalk-stream-sdk-python](https://github.com/open-dingtalk/dingtalk-stream-sdk-python)。
+> 钉钉会**自己**去抓取 webhook markdown 里的图片 URL。家庭内网没有公网地址，
+> 钉钉抓不到 —— 这就是「报告能看到、照片永远看不到」的根因。
+> 企业内部机器人单聊则可以完全绕开公网：官方文档明确 `sampleImageMsg` 的
+> `photoURL` **「可填写图片的完整 URL 路径，也可填写图片的 mediaId」**。
+
+### 配置步骤
+
+1. [钉钉开放平台](https://open-dev.dingtalk.com/) → 应用开发 → **创建企业内部应用**
+   * 在「凭证与基础信息」拿到 `Client ID` / `Client Secret`，填入 `.env` 的
+     `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET`；
+   * 「机器人」页签开启机器人能力，拿到 `robotCode`，填入 `.env` 的 `DINGTALK_ROBOT_CODE`；
+   * 「事件订阅」选 **Stream 模式**（接收 @机器人 消息，无需公网回调地址）；
+   * **权限管理**里申请 **「企业内机器人发送消息权限」**，然后**发布应用**。
+2. **在钉钉里给机器人发一条消息**（例如「订阅」）—— 这一步不能省：
+   * 钉钉不允许机器人凭空发起单聊，用户必须先说过话；
+   * 顺带完成订阅，程序会自动把你的 `userId` 记到 `data/subscribers.json`。
+3. （可选）在 `config.yaml` 的 `dingtalk.user_ids` 里直接预置接收人 `userId`。
+
+### 每日推送
+
+`config.yaml`：
+
+```yaml
+push:
+  enabled: true
+  send_photo: true          # false = 只推文字报告
+  daily_report:
+    hour: 13                # 每天 13:00
+    minute: 0
+```
+
+到点后依次推送 **① 今日照片 → ② 分析中提示 → ③ 生长报告**。
+照片先于报告送达（AI 分析要几十秒），且**照片推送失败会在报告抬头显式告警**。
 
 ### 群里支持的指令
 
 | 指令示例           | 含义 |
 |--------------------|------|
 | `浇水 多肉`        | 给多肉默认浇水量 |
-| `浇水 通道3 600`   | 给 3 号通道浇 600ml |
+| `浇水 通道3 30`    | 给 3 号通道浇 30 秒 |
 | `报告`             | 拍照 + 生成生长报告 |
 | `拍照`             | 仅拍照 |
-| `状态`             | 查看 4 路状态 |
+| `订阅`             | 开启每日照片+报告推送 |
+| `状态`             | 查看 4 路状态 + 推送通道自检 |
 | `帮助`             | 查看指令说明 |
+
+> 实现参考 [open-dingtalk/dingtalk-stream-sdk-python](https://github.com/open-dingtalk/dingtalk-stream-sdk-python)。
 
 ## 安全特性
 
@@ -144,6 +206,7 @@ python main.py
 | `system.mock_hardware` | `false` | `true` 时全部走模拟（PC/Mac 开发）；`false` 时使用真实硬件 |
 | `camera.allow_mock_fallback` | `false` | 仅在"无相机也要跑通流程"时才设 `true`；此时照片名带 `MOCK_` 前缀且日志为 WARNING |
 | `safety.allow_mock_fallback` | `false` | 同上，作用于 GPIO；为 `true` 时浇水不会真正开阀，日志会明确告警 |
+| `ai.allow_mock_fallback` | `false` | 同上，作用于 AI 报告；为 `true` 时报告抬头带 `⚠️ [MOCK]` 横幅且**评分置空** |
 
 异常按三类归档，便于快速定位：
 
@@ -214,6 +277,31 @@ python tools/camera_diag.py --live --baseline   # 把本次画质指标存为基
 
    完全没输出 → 检查 FPC 排线方向/插紧（Pi 5 排线朝向与 Pi 4 不同），
    确认 `/boot/firmware/config.txt` 中 `camera_auto_detect=1` 且**没有** `start_x=1`（legacy 栈冲突），改完重启。
+
+## 推送诊断
+
+没收到每日照片/报告时，在树莓派上运行：
+
+```bash
+.venv/bin/python tools/dingtalk_diag.py           # 只读自检（不发消息）
+.venv/bin/python tools/dingtalk_diag.py --live    # 额外上传测试图并真实发送一条消息
+```
+
+退出码：`0` 就绪 ／ `1` 不可用（凭证缺失、网络不通、接口报错）／
+`2` 通道可用但**没有接收人**（消息发得出去，但没人收得到）。
+
+常见原因：
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| `no_session` / `robot.oto.notExist` | 用户从没和机器人说过话 | 在钉钉里给机器人发一条消息 |
+| `not_configured` | `.env` 缺 `DINGTALK_CLIENT_ID/SECRET/ROBOT_CODE` | 补齐后重启 |
+| `no_permission` | 没申请「企业内机器人发送消息权限」 | 开发者后台申请并**发布应用** |
+| 通道就绪但没人收到 | 订阅名单为空 | 给机器人发「订阅」，或填 `dingtalk.user_ids` |
+| 只看到报告、看不到照片 | 用的是 webhook 通道（内网发不出图片） | 改用企业机器人单聊通道 |
+
+启动时 `main.py` 会做一次推送自检：没有可用通道会打 **ERROR** 日志并提示缺什么，
+**不会**静默假装发送成功。
 
 ## 常见问题
 
