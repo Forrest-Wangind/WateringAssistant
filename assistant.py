@@ -30,13 +30,16 @@ class WateringAssistant:
             # 默认不允许静默降级：GPIO 不可用直接抛 HardwareError
             allow_mock_fallback=bool(safety.get("allow_mock_fallback", False)),
         )
+        cam_cfg = cfg.get("camera", {})
         self.camera = Camera(
             photo_dir=sys_cfg.get("photo_dir", "./data/photos"),
-            resolution=tuple(cfg.get("camera", {}).get("resolution", (1920, 1080))),
-            warmup_sec=float(cfg.get("camera", {}).get("warmup_sec", 2.0)),
+            resolution=tuple(cam_cfg.get("resolution", (1920, 1080))),
+            warmup_sec=float(cam_cfg.get("warmup_sec", 2.0)),
             mock=bool(sys_cfg.get("mock_hardware", False)),
             # 默认不允许静默降级：mock_hardware=false 时相机不可用直接抛 CameraError
-            allow_mock_fallback=bool(cfg.get("camera", {}).get("allow_mock_fallback", False)),
+            allow_mock_fallback=bool(cam_cfg.get("allow_mock_fallback", False)),
+            # 对焦 / 曝光 / 画质门禁参数（缺省项由 camera.py 补默认值）
+            capture_settings=cam_cfg,
         )
         self.analyzer = PlantAnalyzer(
             ai_cfg=cfg.get("ai", {}),
@@ -62,12 +65,12 @@ class WateringAssistant:
     # ---------- 报告 ----------
     def take_photo_and_report(self, push: bool = True) -> AnalysisReport:
         photo = self.camera.capture("garden")
-        mock_banner = self._mock_banner()
+        banners = self._warnings()
         if push:
-            self.bot.send_text(f"📷 已拍摄花园照片: {photo.name}，正在分析…{mock_banner}")
+            self.bot.send_text(f"📷 已拍摄花园照片: {photo.name}，正在分析…{banners}")
         report = self.analyzer.analyze(photo)
-        if mock_banner:
-            report = replace(report, markdown=mock_banner.strip() + "\n\n" + report.markdown)
+        if banners:
+            report = replace(report, markdown=banners.strip() + "\n\n" + report.markdown)
         if push:
             title = "🌿 花园生长报告"
             score = f"  健康评分 {report.score}/5" if report.score else ""
@@ -77,8 +80,12 @@ class WateringAssistant:
     def take_photo_only(self, push: bool = True) -> str:
         photo = self.camera.capture("garden")
         if push:
-            self.bot.send_text(f"📷 已拍照: {photo.resolve()}{self._mock_banner()}")
+            self.bot.send_text(f"📷 已拍照: {photo.resolve()}{self._warnings()}")
         return str(photo.resolve())
+
+    def _warnings(self) -> str:
+        """把 mock / 画质两类告警拼成报告抬头，均为空时返回空串。"""
+        return self._mock_banner() + self._quality_banner()
 
     def _mock_banner(self) -> str:
         """相机处于 mock 模式时返回醒目提示（含分类原因），否则返回空串。"""
@@ -90,6 +97,23 @@ class WateringAssistant:
             f"详见日志或运行 `python tools/camera_diag.py`）"
         )
 
+    def _quality_banner(self) -> str:
+        """成片画质异常时返回醒目提示。
+
+        模糊的照片照样能送进 AI，模型仍会一本正经地给出"叶色正常"之类的结论 ——
+        这是本项目最危险的静默失败，所以必须把画质结论显式顶到报告最前面。
+        """
+        q = self.camera.last_quality or {}
+        if not q or q.get("level") in (None, "ok"):
+            return ""
+        findings = "；".join(q.get("findings") or [])
+        advice = "；".join(q.get("advice") or [])
+        return (
+            f"\n⚠️ [画质告警] {findings}（清晰度 {q.get('sharpness')} / 对比度 {q.get('contrast')}）"
+            f"\n💡 {advice}"
+            f"\n详见 docs/camera_image_quality.md，或运行 `python tools/camera_diag.py --live`"
+        )
+
     # ---------- 状态 ----------
     def status_text(self) -> str:
         cam = self.camera.status()
@@ -99,6 +123,14 @@ class WateringAssistant:
         )
         if cam["is_mock"] and cam["error_kind"]:
             cam_line += f"（[{cam['error_kind']}] {cam['mock_reason']}）"
+        if cam.get("resolution_hint"):
+            cam_line += f"\n> ⚠️ {cam['resolution_hint']}"
+        q = cam.get("last_quality") or {}
+        if q.get("level") in ("warn", "bad"):
+            cam_line += (
+                f"\n> ⚠️ 上次成片画质异常[{q['level']}]："
+                f"{'；'.join(q.get('findings') or [])}"
+            )
         rows = ["**🌱 浇花助理状态**", "", cam_line, "", "| 通道 | 植物 | 桶 | 上次浇水(s) | 计划 |", "|---|---|---|---|---|"]
         for s in self.valve.status():
             rows.append(
@@ -121,7 +153,7 @@ class WateringAssistant:
                 return self.status_text()
             if cmd.action == "photo":
                 path = self.take_photo_only(push=False)
-                return f"📷 已拍照: {path}{self._mock_banner()}"
+                return f"📷 已拍照: {path}{self._warnings()}"
             if cmd.action == "report":
                 report = self.take_photo_and_report(push=False)
                 score = f"  健康评分 {report.score}/5" if report.score else ""

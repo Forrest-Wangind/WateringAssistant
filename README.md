@@ -157,11 +157,42 @@ python main.py
 
 ```bash
 python tools/camera_diag.py          # 环境自检（不动相机）
-python tools/camera_diag.py --live   # 额外做一次真实打开 + 拍照
+python tools/camera_diag.py --live   # 额外做一次真实打开 + 拍照 + 画质体检
+python tools/camera_diag.py --live --baseline   # 把本次画质指标存为基线，供日后对比
 ```
 
 脚本会输出：解释器是否在 venv、`picamera2`/`libcamera` 是否可见、`/dev/video*`、
 当前用户是否在 `video` 组、`config.txt` 的相机配置，并给出**分类结论 + 修复建议**。
+加 `--live` 后还会给出成片的清晰度/对比度/亮度、对焦过程与拍摄元数据（曝光、增益、对焦位置）。
+
+退出码：`0` = 正常，`1` = 相机不可用，**`2` = 相机可用但成片画质异常**（照片能拍但不清晰）。
+
+### 照片能拍出来，但很模糊
+
+> 详细分析见 [docs/camera_image_quality.md](docs/camera_image_quality.md)。
+
+相机是 **Pi Camera v3（IMX708，带自动对焦）**。libcamera 不会在拍照瞬间自动帮你对一次焦，
+所以代码必须在拍照前显式触发对焦 —— 早期版本漏了这一步，等于**盲拍**，对焦环停在无穷远，
+拍 0.5~2m 外的花架整幅发虚。现已修复（`camera.autofocus: auto`）。
+
+按症状快速分诊：
+
+| 症状 | 原因 | 处置 |
+|---|---|---|
+| 整幅均匀糊，无一处清晰 | 未合焦 / 镜头保护膜没撕 | 先撕膜；再看 `camera_diag --live` 的 `last_focus` 与 `af_state` |
+| 一半清晰一半糊（分层） | 景深不足（L3 顶端到 L1 底层跨 0.3~2m，f/1.8 不够） | 光学限制，用 `lens_position` 锁定中距离，见文档 §6 |
+| 叶片有拖影 | 暗光下曝光过长 | 调小 `camera.max_exposure_us`，或设 `exposure_mode: short` |
+| 局部模糊斑块 / 亮斑 | 水渍、水雾、结露（本项目会喷水） | 擦净镜头 |
+
+推荐验证流程：
+
+```bash
+.venv/bin/python tools/camera_diag.py --live   # 看画质结论与「已生效控件」
+.venv/bin/python tests/photoAndAnalyse.py --photo   # 走完整拍照链路，直接打印画质指标
+```
+
+> ⚠️ 若 `--live` 输出里出现「未生效控件」，说明当前 libcamera 版本不接受某个控件名
+> （如 `AfMode`、`FrameDurationLimits`），对焦/曝光就不会受控 —— 把该行内容贴出来排查。
 
 最常见的两个原因：
 

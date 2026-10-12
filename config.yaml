@@ -45,11 +45,43 @@ safety:
   allow_mock_fallback: false
 
 camera:
-  resolution: [1920, 1080]
+  # IMX708(Pi Camera v3) 的原生模式是 4608x2592 / 2304x1296 / 1536x864。
+  # 2304x1296 = 全视野 2:1 binning，ISP 无需缩放，画质最好（16:9，与原 1080p 同视角）。
+  # 原先的 1920x1080 不在原生列表里，要 ISP 重采样，画面会偏软。
+  resolution: [2304, 1296]
   warmup_sec: 2
   # 仅当"没有相机也要跑通全流程"时才设为 true。
   # false（推荐）：picamera2 不可用时抛出 CameraError，杜绝误把占位图当真实照片。
   allow_mock_fallback: false
+
+  # ---- 对焦（"拍照模糊"的首要修复点）----
+  # IMX708 是 VCM 自动对焦模组，libcamera 不会在拍照瞬间自动对焦，必须显式触发。
+  # auto = 拍照前跑一次单次对焦循环（静止花架首选）
+  # continuous = 持续对焦（适合移动目标；但 Picamera2 在该模式下不允许 autofocus_cycle）
+  # manual = 固定焦距，配合 lens_position（屈光度：0=无穷远，1=1m，10=10cm）
+  # 注意：L3 顶端俯角 30°，到 L3 植物约 0.3~0.5m、到 L1 约 1.5~2m，
+  #       f/1.8 景深有限 —— 只能保证一个平面清晰，详见 docs/camera_image_quality.md
+  autofocus: auto
+  af_range: normal          # normal | macro（主拍 <30cm 近景时改 macro）
+  af_wait_sec: 6            # continuous 模式下等待对焦收敛的上限
+  lens_position: null       # 仅 autofocus=manual 时生效
+
+  # ---- 曝光（防"运动模糊/拖影"）----
+  # IMX708 最长曝光可达 ~1.7s，清晨/傍晚光线不足时 AEC 会拉得很长，
+  # 有风时叶片就会拖影。限制帧时长上限 = 限制最长曝光。
+  max_exposure_us: 66666    # 1/15s
+  exposure_mode: auto       # auto | short（优先短曝光，抗拖影）| long
+  sharpness_boost: 1.5      # ISP 锐化（默认 1.0）
+  jpeg_quality: 95
+  settle_frames: 2          # 拍照前丢弃的帧数，让 AE/AWB 收敛
+
+  # ---- 画质门禁：成片低于阈值时在日志/状态里显式告警，绝不沉默 ----
+  # 阈值为经验下限（基于本地标定：清晰 ~100，模糊半径 1.6px ~28，半径 4px ~2）。
+  # 绝对值与拍摄场景强相关，建议在树莓派上拍一张正常照片后据实调整。
+  quality_guard:
+    enabled: true
+    min_sharpness: 8.0
+    min_contrast: 12.0
 
 ai:
   provider: anthropic
