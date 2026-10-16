@@ -106,7 +106,7 @@ ai:
   # 然后凭空编造一份看着很正常的花园分析。判定为 false 时程序会直接拒绝发送照片。
   supports_vision: null
 
-  max_tokens: 1500
+  max_tokens: 4500
   # DeepSeek 等开启思考模式的模型不支持 temperature（传了也不报错、也不生效），
   # 默认不传；需要时再填 0~1 的值。
   temperature: null
@@ -118,9 +118,11 @@ ai:
   # 厂商私有参数，原样并入请求体（不同厂商的扩展字段放这里）。
   # 示例 —— 关闭 DeepSeek 思考模式：思考默认开启且会占用大量输出 token，
   # 对"看图写报告"这类任务没必要，关掉可显著降低延迟与 token 消耗。
-  # extra_body:
-  #   thinking:
-  #     type: disabled
+  # ⚠️ 此项必须开启：实测 max_tokens=1500 时思考内容就会吃光全部输出 token，
+  #    导致 content 为空（truncated）→ 报告永远生成不出来（10-15/10-16 两天复现）。
+  extra_body:
+    thinking:
+      type: disabled
 
   # 仅当"没有 AI Key 也要跑通全流程"时才设为 true。
   # false（推荐）：缺 Key / 调用失败时抛 AIError，绝不拿占位报告冒充真实分析。
