@@ -1,130 +1,128 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""多路浇花助理主入口。
 
-"""浇花助理总入口：装配 GPIO / Camera / Vision / Reporter / Scheduler / 钉钉。"""
+启动顺序：
+  1. 加载配置 + 初始化日志
+  2. 构造 WateringAssistant（硬件 + AI + 钉钉）
+  3. 注册定时任务（4 路浇水 + 每日报告）
+  4. 启动钉钉 Stream 客户端（后台线程，接收 @机器人 消息）
+  5. 启动 FastAPI（REST 接口）
+"""
+from __future__ import annotations
 
 import logging
 import signal
 import sys
-from typing import Optional
 
-import dingtalk_stream
+import uvicorn
 
-from dingtalk_bot import (
-    WateringChatbotHandler,
-    get_dingtalk_access_token,
-)
-from watering.camera import Camera, CameraError
-from watering.config import load_config
-from watering.gpio_controller import GPIOController, GPIOUnavailableError
-from watering.reporter import Reporter
-from watering.scheduler import WateringScheduler
-from watering.vision import VisionAnalyzer
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+from assistant import WateringAssistant
+from dingtalk.bot import start_stream_client
+from hardware.errors import HardwareError
+from scheduler.watering_scheduler import WateringScheduler
+from utils import load_config, setup_logging
+from web.server import create_app
 
 
-def main() -> None:
+def main() -> int:
     cfg = load_config()
+    setup_logging(cfg.get("system", {}).get("log_level", "INFO"))
+    log = logging.getLogger("main")
 
-    missing = [
-        k
-        for k, v in {
-            "DINGTALK_CLIENT_ID": cfg.dingtalk_client_id,
-            "DINGTALK_CLIENT_SECRET": cfg.dingtalk_client_secret,
-            "DINGTALK_ROBOT_CODE": cfg.dingtalk_robot_code,
-        }.items()
-        if not v
-    ]
-    if missing:
-        logger.error("环境变量缺失: %s", ", ".join(missing))
-        sys.exit(1)
-
-    if not get_dingtalk_access_token():
-        logger.error("钉钉 Access Token 获取失败，停止启动")
-        sys.exit(1)
-
-    # ---------- GPIO ----------
     try:
-        gpio = GPIOController(cfg.channels, cfg.relay)
-    except GPIOUnavailableError as e:
-        logger.error("%s", e)
-        sys.exit(1)
+        assistant = WateringAssistant(cfg)
+    except HardwareError as exc:
+        # 硬件不可用：立即退出并给出可执行建议，绝不以模拟方式继续运行
+        log.error(
+            "启动失败：硬件不可用 [%s]\n%s\n修复建议：%s\n"
+            "（若只想在本机跑通流程，请把 config.yaml 的 system.mock_hardware 设为 true）",
+            exc.kind, exc, exc.hint,
+        )
+        return 2
+    cam = assistant.camera.status()
+    if cam["is_mock"]:
+        log.warning("⚠️ 相机处于 MOCK 模式：生成的照片为占位图（mode=%s kind=%s）",
+                    cam["mode"], cam["error_kind"])
+    else:
+        log.info("📷 相机就绪：%s", cam["mode"])
+    scheduler = WateringScheduler(timezone=cfg.get("system", {}).get("timezone", "Asia/Shanghai"))
+    scheduler.schedule_channels(
+        cfg["channels"],
+        water_fn=lambda cid: _safe_run(lambda: assistant.water_channel(cid, notify=True)),
+    )
 
-    # ---------- 摄像头 + 视觉 + 报告 ----------
-    reporter: Optional[Reporter] = None
-    camera: Optional[Camera] = None
-    if cfg.report.enabled:
-        if not cfg.dashscope_api_key:
-            logger.warning("DASHSCOPE_API_KEY 未配置，禁用日报")
+    # ---- 推送通道自检：发不出去必须立刻可见，不能等到晚上才发现没收到照片 ----
+    push_st = assistant.bot.delivery_status()
+    if push_st["channel"] == "none":
+        if push_st["mock_fallback"]:
+            log.info("钉钉推送为本地打印模式（system.mock_hardware=true）")
         else:
-            try:
-                camera = Camera(
-                    cfg.storage.photo_dir,
-                    cfg.report.image_width,
-                    cfg.report.image_height,
-                )
-                vision = VisionAnalyzer(cfg.vision, cfg.dashscope_api_key)
-                reporter = Reporter(cfg, camera, vision)
-            except CameraError as e:
-                logger.error("摄像头初始化失败，禁用日报: %s", e)
+            log.error(
+                "⚠️ 没有可用的钉钉推送通道（缺少 %s）—— 定时浇水仍会执行，"
+                "但每日照片与报告**无法送达**。请配置企业机器人"
+                "（DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET / DINGTALK_ROBOT_CODE）"
+                "或自定义机器人 webhook。",
+                ", ".join(push_st["missing_credentials"]) or "全部凭证",
+            )
+    elif not push_st["recipients"]:
+        log.warning(
+            "⚠️ 推送通道就绪(%s)，但还没有接收人：在钉钉里给机器人发一条消息即可自动订阅",
+            push_st["channel"],
+        )
+    else:
+        log.info("📮 钉钉推送就绪：通道=%s 接收人=%d 位",
+                 push_st["channel"], len(push_st["recipients"]))
 
-    # ---------- 调度器 ----------
-    scheduler = WateringScheduler(cfg, gpio, reporter)
+    push_cfg = cfg.get("push", {})
+    daily = push_cfg.get("daily_report", {}) or {}
+    if push_cfg.get("enabled", True):
+        scheduler.schedule_daily_report(
+            hour=int(daily.get("hour", 13)), minute=int(daily.get("minute", 0)),
+            report_fn=lambda: _safe_run(
+                lambda: assistant.take_photo_and_report(push=True),
+                on_error=lambda exc: assistant.notify_failure("每日照片/报告任务失败", exc),
+            ),
+        )
+    else:
+        log.warning("push.enabled=false，未注册每日照片/报告任务")
     scheduler.start()
 
-    # ---------- 钉钉 Stream ----------
-    handler = WateringChatbotHandler(
-        controller=gpio,
-        reporter=reporter,
-        default_duration=cfg.relay.default_duration_seconds,
-    )
-    credential = dingtalk_stream.Credential(
-        cfg.dingtalk_client_id, cfg.dingtalk_client_secret
-    )
-    stream_client = dingtalk_stream.DingTalkStreamClient(credential=credential)
-    stream_client.register_callback_handler(
-        "/v1.0/im/bot/messages/get", handler
-    )
+    start_stream_client(cfg.get("dingtalk", {}), assistant.handle_command,
+                        on_sender=assistant.note_subscriber)
 
-    # ---------- 优雅退出 ----------
-    def _shutdown(signum, _frame):
-        logger.info("收到信号 %s，开始关闭", signum)
-        try:
-            scheduler.stop()
-        except Exception:
-            logger.exception("scheduler stop 异常")
-        try:
-            gpio.cleanup()
-        except Exception:
-            logger.exception("gpio cleanup 异常")
-        if camera is not None:
-            try:
-                camera.close()
-            except Exception:
-                logger.exception("camera close 异常")
+    app = create_app(assistant)
+    web_cfg = cfg.get("web", {})
+
+    def _shutdown(*_):
+        log.info("收到退出信号，清理资源…")
+        scheduler.shutdown()
+        assistant.shutdown()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    logger.info("=" * 50)
-    logger.info("🌱 浇花助理已启动")
-    logger.info("通道: %d  定时任务: %d  日报: %s",
-                len(cfg.channels), len(cfg.schedules),
-                "开" if reporter else "关")
-    logger.info("接收人: %s", ", ".join(cfg.report_recipients) or "（未配置）")
-    logger.info("=" * 50)
+    log.info("启动 Web 服务 %s:%s", web_cfg.get("host", "0.0.0.0"), web_cfg.get("port", 8080))
+    uvicorn.run(
+        app,
+        host=web_cfg.get("host", "0.0.0.0"),
+        port=int(web_cfg.get("port", 8080)),
+        log_level=cfg.get("system", {}).get("log_level", "INFO").lower(),
+    )
+    return 0
 
+
+def _safe_run(fn, on_error=None):
+    """执行定时任务；失败时先记日志，再尽力把失败原因推给用户（否则用户毫无感知）。"""
     try:
-        stream_client.start_forever()
-    except KeyboardInterrupt:
-        _shutdown(signal.SIGINT, None)
+        fn()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("scheduler").exception("定时任务执行失败")
+        if on_error is not None:
+            try:
+                on_error(exc)
+            except Exception:  # noqa: BLE001  通知失败不能再往上抛
+                logging.getLogger("scheduler").exception("失败通知推送失败")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

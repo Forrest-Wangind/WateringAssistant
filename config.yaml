@@ -1,67 +1,185 @@
-# 浇花助理配置文件
-# 修改本文件后重启服务生效
+system:
+  log_level: INFO
+  data_dir: ./data
+  photo_dir: ./data/photos
+  report_dir: ./data/reports
+  timezone: Asia/Shanghai
+  # true  = 纯模拟（PC/Mac 本地开发、跑测试）；GPIO / 相机都不碰硬件
+  # false = 使用真实硬件（树莓派）。此时相机或 GPIO 不可用会**直接报错**，不会静默降级
+  mock_hardware: false
 
-# ========== 浇水通道 ==========
-# 4 路继电器，BCM 编号
-# active_low: 多数继电器板低电平触发，置 true；如继电器为高电平触发改为 false
+# 4 路浇水通道：每一路连接一个继电器驱动的 12V 电磁阀
+# pin 使用 BCM 编号，继电器高电平触发
 channels:
   - id: 1
-    name: 阳台月季
-    gpio_pin: 17
+    name: 热带植物
+    pin: 17
+    bucket: 桶A
+    default_duration_sec: 60   # 单次默认开阀时长(秒)；冬季降频后单次给足量
+    schedule_cron: "0 7 * * sun"   # 每周日 7:00（APScheduler 中 0=周一，故用 sun 而非 0）
   - id: 2
-    name: 客厅绿萝
-    gpio_pin: 27
+    name: 多肉植物
+    pin: 27
+    bucket: 桶B
+    default_duration_sec: 7
+    schedule_cron: "0 8 */7 * *"   # 每 7 天 8:00
   - id: 3
-    name: 卧室多肉
-    gpio_pin: 22
+    name: 中生植物
+    pin: 22
+    bucket: 桶C
+    default_duration_sec: 28
+    schedule_cron: "0 7 */2 * *"   # 每 2 天 7:00
   - id: 4
-    name: 厨房香草
-    gpio_pin: 23
+    name: 水生植物
+    pin: 23
+    bucket: 桶D
+    default_duration_sec: 83      # 用于补水，保持水位
+    schedule_cron: "0 9 */3 * *"   # 每 3 天 9:00
 
-relay:
-  active_low: true
-  # 单次浇水时长上限（秒），防止程序异常导致持续放水
-  max_duration_seconds: 600
-  # 默认手动浇水时长（秒）
-  default_duration_seconds: 30
+safety:
+  max_single_run_sec: 180        # 单次最长运行 3 分钟，防止干转
+  cooldown_sec: 30               # 同一通道两次启动之间的冷却时间
+  global_lock: true              # 同一时刻只允许一路电磁阀运行
+  # 仅当"没有 GPIO 也要跑通全流程"时才设为 true。
+  # false（推荐）：GPIO 后端不可用时抛 HardwareError，避免"浇水成功"实际没开阀。
+  allow_mock_fallback: false
 
-# ========== 定时浇水任务 ==========
-# 每条任务一行 cron 表达式（分 时 日 月 周），与 APScheduler 一致
-# duration_seconds 为该次浇水时长
-schedules:
-  - name: 早晨浇花
-    cron: "0 7 * * *"
-    channel_id: 1
-    duration_seconds: 60
-  - name: 傍晚补水
-    cron: "0 19 * * *"
-    channel_id: 2
-    duration_seconds: 45
+camera:
+  # IMX708(Pi Camera v3) 的原生模式是 4608x2592 / 2304x1296 / 1536x864。
+  # 2304x1296 = 全视野 2:1 binning，ISP 无需缩放，画质最好（16:9，与原 1080p 同视角）。
+  # 原先的 1920x1080 不在原生列表里，要 ISP 重采样，画面会偏软。
+  resolution: [2304, 1296]
+  warmup_sec: 2
+  # 仅当"没有相机也要跑通全流程"时才设为 true。
+  # false（推荐）：picamera2 不可用时抛出 CameraError，杜绝误把占位图当真实照片。
+  allow_mock_fallback: false
 
-# ========== 每日图文报告 ==========
-report:
+  # ---- 对焦（"拍照模糊"的首要修复点）----
+  # IMX708 是 VCM 自动对焦模组，libcamera 不会在拍照瞬间自动对焦，必须显式触发。
+  # auto = 拍照前跑一次单次对焦循环（静止花架首选）
+  # continuous = 持续对焦（适合移动目标；但 Picamera2 在该模式下不允许 autofocus_cycle）
+  # manual = 固定焦距，配合 lens_position（屈光度：0=无穷远，1=1m，10=10cm）
+  # 注意：L3 顶端俯角 30°，到 L3 植物约 0.3~0.5m、到 L1 约 1.5~2m，
+  #       f/1.8 景深有限 —— 只能保证一个平面清晰，详见 docs/camera_image_quality.md
+  autofocus: auto
+  af_range: normal          # normal | macro（主拍 <30cm 近景时改 macro）
+  af_wait_sec: 6            # continuous 模式下等待对焦收敛的上限
+  lens_position: null       # 仅 autofocus=manual 时生效
+
+  # ---- 曝光（防"运动模糊/拖影"）----
+  # IMX708 最长曝光可达 ~1.7s，清晨/傍晚光线不足时 AEC 会拉得很长，
+  # 有风时叶片就会拖影。限制帧时长上限 = 限制最长曝光。
+  max_exposure_us: 66666    # 1/15s
+  exposure_mode: auto       # auto | short（优先短曝光，抗拖影）| long
+  sharpness_boost: 1.5      # ISP 锐化（默认 1.0）
+  jpeg_quality: 95
+  settle_frames: 2          # 拍照前丢弃的帧数，让 AE/AWB 收敛
+
+  # ---- 画质门禁：成片低于阈值时在日志/状态里显式告警，绝不沉默 ----
+  # 阈值为经验下限（基于本地标定：清晰 ~100，模糊半径 1.6px ~28，半径 4px ~2）。
+  # 绝对值与拍摄场景强相关，建议在树莓派上拍一张正常照片后据实调整。
+  quality_guard:
+    enabled: true
+    min_sharpness: 8.0
+    min_contrast: 12.0
+
+# ---- AI 多模态分析（可切换供应商）----
+# 换模型只改这一段，不用动代码。支持任意 OpenAI / Anthropic 兼容端点。
+# 详细配置与各厂商示例见 docs/ai_providers.md；自检用 `python tools/ai_diag.py`。
+ai:
+  # 内置可选：deepseek | anthropic | openai | openai_compatible | ollama | mock
+  #   通义 / Moonshot / 智谱 / 自建网关 等一律用 openai_compatible，再填 base_url。
+  provider: deepseek
+  # 留空则用该 provider 的默认模型。**建议显式写明** —— 模型名会随厂商迭代变化。
+  #   DeepSeek 只有 deepseek-flash 支持图片；deepseek-v4-pro 是纯文本（发图会被静默丢弃）。
+  model: deepseek-flash
+  # 读取 API Key 的环境变量名（值写在 .env 里，勿写进本文件）
+  api_key_env: DEEPSEEK_API_KEY
+  # 自定义端点，留空用 provider 默认值（deepseek / anthropic / openai 都不需要填）。
+  #   Moonshot : https://api.moonshot.cn/v1
+  #   通义     : https://dashscope.aliyuncs.com/compatible-mode/v1
+  #   DeepSeek 的 Anthropic 兼容端点: https://api.deepseek.com/anthropic
+  base_url: null
+
+  # 模型是否有视觉能力。**留空即由内置预设自动判定**（deepseek 按模型白名单）。
+  # 之所以要这个开关：纯文本模型收到图片通常**不报错**，只会把图片换成占位文字，
+  # 然后凭空编造一份看着很正常的花园分析。判定为 false 时程序会直接拒绝发送照片。
+  supports_vision: null
+
+  max_tokens: 4500
+  # DeepSeek 等开启思考模式的模型不支持 temperature（传了也不报错、也不生效），
+  # 默认不传；需要时再填 0~1 的值。
+  temperature: null
+  timeout_sec: 60
+  # 图片细节级别（仅 OpenAI 兼容端点生效）：
+  #   high = 保留原图（默认，能看清叶片细节）；low = 缩到 512×512，更快更省 token。
+  image_detail: high
+
+  # 厂商私有参数，原样并入请求体（不同厂商的扩展字段放这里）。
+  # 示例 —— 关闭 DeepSeek 思考模式：思考默认开启且会占用大量输出 token，
+  # 对"看图写报告"这类任务没必要，关掉可显著降低延迟与 token 消耗。
+  # ⚠️ 此项必须开启：实测 max_tokens=1500 时思考内容就会吃光全部输出 token，
+  #    导致 content 为空（truncated）→ 报告永远生成不出来（10-15/10-16 两天复现）。
+  extra_body:
+    thinking:
+      type: disabled
+
+  # 仅当"没有 AI Key 也要跑通全流程"时才设为 true。
+  # false（推荐）：缺 Key / 调用失败时抛 AIError，绝不拿占位报告冒充真实分析。
+  allow_mock_fallback: false
+
+  system_prompt: |
+    你是一名严谨的园艺师，只依据画面中可见的信息作答，不要编造看不到的细节。
+  prompt: |
+    你是一名资深园艺师。请基于这张花园照片，分析画面中可见盆栽的整体生长状况，
+    分别从下列维度给出图文报告：
+      1. 整体观感与构图
+      2. 叶色 / 形态异常（黄叶、徒长、虫害、缺水、烂根迹象）
+      3. 浇水建议（结合热带 / 多肉 / 中生 / 水生 4 类）
+      4. 下一步养护 TODO 清单
+    使用 Markdown，简洁分点，并在结尾给出 1-5 分的综合健康评分。
+
+dingtalk:
+  # ---- 通道一：企业内部机器人单聊（推荐，唯一能在无公网环境发照片的通道）----
+  # 照片走 media/upload 拿 mediaId，再作为 sampleImageMsg 的 photoURL 发送，
+  # 全程只需要 accessToken，不依赖公网 IP、不需要图床、不需要 AgentId。
+  # 前置条件：开发者后台申请「企业内机器人发送消息权限」+ 应用已发布。
+  client_id_env: DINGTALK_CLIENT_ID          # 企业内部应用 Client ID（=AppKey）
+  client_secret_env: DINGTALK_CLIENT_SECRET  # 企业内部应用 Client Secret（=AppSecret）
+  robot_code_env: DINGTALK_ROBOT_CODE        # 机器人编码（机器人 ID）
+
+  # 主动推送的目标 userId。**留空即可**：你在钉钉里给机器人发一条消息后，
+  # 程序会把你的 userId 自动记录到下面的文件，之后每日推送即可送达。
+  # （钉钉不允许机器人凭空发起单聊，用户必须先和机器人说过话。）
+  user_ids: []
+  subscribers_file: ./data/subscribers.json
+
+  # ---- 通道二：自定义机器人 webhook（只能发群；图片必须公网可访问）----
+  # 家庭内网无公网 IP 时，这里配了也发不出图片，故默认留空。
+  webhook_env: DINGTALK_WEBHOOK
+  secret_env: DINGTALK_SECRET
+  # 若把照片放到公网（对象存储/反代），在此填 URL 前缀，webhook 通道才能引用
+  image_public_base_url: ""
+
+  # 单次请求超时（秒）与 markdown 内容上限（超出会截断，钉钉对过长内容直接拒收）
+  push_timeout_sec: 15
+  max_markdown_chars: 3500
+
+  # Stream 模式接收 @机器人 消息（无需公网回调）
+  # 注：与上面的 Client ID/Secret 是同一对企业应用凭证，不需要重复配置
+  # 仅允许下列 userId / unionId 下发浇花指令
+  allowed_users: []
+
+# 每日照片 + 报告推送
+push:
   enabled: true
-  # 报告生成时间（24h cron）
-  cron_list:
-    - "0 8 * * *"
-    - "0 18 * * *"
-  # 拍照分辨率
-  image_width: 1280
-  image_height: 720
-  # 接收报告的钉钉用户 ID（在 .env 的 DINGTALK_RECIPIENT_USER_IDS 中维护，留空则用此处）
-  recipient_user_ids: []
+  # 是否推送照片（false = 只推文字报告）
+  send_photo: true
+  # 每日推送时间（服务器时区见 system.timezone）
+  daily_report:
+    hour: 13
+    minute: 0
 
-# ========== 视觉模型 ==========
-vision:
-  provider: dashscope
-  model: qwen-vl-max
-  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  # 单次分析超时（秒）
-  timeout: 60
-
-# ========== 数据存储 ==========
-storage:
-  photo_dir: data/photos
-  report_dir: data/reports
-  # 仅保留最近 N 天照片，0 表示不清理
-  keep_days: 30
+web:
+  host: 0.0.0.0
+  port: 8080
