@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import replace
 from typing import Any, Dict, Optional
 
+from ai.errors import AIError
 from ai.plant_analyzer import AnalysisReport, PlantAnalyzer
 from dingtalk.bot import Command, DingTalkBot, help_text, parse_command
-from hardware.camera import Camera
+from dingtalk.subscribers import SubscriberStore
+from hardware.camera import Camera, CameraError
 from hardware.valve_controller import ValveController
 from utils import find_channel_by_name, get_channel
 
@@ -26,18 +29,39 @@ class WateringAssistant:
             max_single_run_sec=int(safety.get("max_single_run_sec", 180)),
             cooldown_sec=int(safety.get("cooldown_sec", 30)),
             global_lock=bool(safety.get("global_lock", True)),
+            # 默认不允许静默降级：GPIO 不可用直接抛 HardwareError
+            allow_mock_fallback=bool(safety.get("allow_mock_fallback", False)),
         )
+        cam_cfg = cfg.get("camera", {})
         self.camera = Camera(
             photo_dir=sys_cfg.get("photo_dir", "./data/photos"),
-            resolution=tuple(cfg.get("camera", {}).get("resolution", (1920, 1080))),
-            warmup_sec=float(cfg.get("camera", {}).get("warmup_sec", 2.0)),
+            resolution=tuple(cam_cfg.get("resolution", (1920, 1080))),
+            warmup_sec=float(cam_cfg.get("warmup_sec", 2.0)),
             mock=bool(sys_cfg.get("mock_hardware", False)),
+            # 默认不允许静默降级：mock_hardware=false 时相机不可用直接抛 CameraError
+            allow_mock_fallback=bool(cam_cfg.get("allow_mock_fallback", False)),
+            # 对焦 / 曝光 / 画质门禁参数（缺省项由 camera.py 补默认值）
+            capture_settings=cam_cfg,
         )
         self.analyzer = PlantAnalyzer(
             ai_cfg=cfg.get("ai", {}),
             report_dir=sys_cfg.get("report_dir", "./data/reports"),
+            # 默认不允许静默降级：缺 API Key / 调用失败 / 模型不支持图片时抛 AIError，
+            # 绝不拿一份"看起来正常"的占位报告冒充真实分析。
+            allow_mock_fallback=bool(cfg.get("ai", {}).get("allow_mock_fallback", False)),
         )
-        self.bot = DingTalkBot(cfg.get("dingtalk", {}))
+        self.push_cfg = cfg.get("push", {})
+        dt_cfg = cfg.get("dingtalk", {})
+        self.bot = DingTalkBot(
+            dt_cfg,
+            # 推送目标 userId 的持久化名单（用户在钉钉里说句话就自动记录）
+            subscribers=SubscriberStore(
+                dt_cfg.get("subscribers_file", "./data/subscribers.json"),
+                preset=dt_cfg.get("user_ids"),
+            ),
+            # 仅本地开发（mock_hardware=true）允许把推送降级为打印日志
+            allow_mock_fallback=bool(sys_cfg.get("mock_hardware", False)),
+        )
         self._water_lock = threading.Lock()
 
     # ---------- 浇水 ----------
@@ -56,31 +80,153 @@ class WateringAssistant:
 
     # ---------- 报告 ----------
     def take_photo_and_report(self, push: bool = True) -> AnalysisReport:
+        """拍照 → 推送照片 → AI 分析 → 推送报告。
+
+        照片必须**先于**报告送达：AI 分析要几十秒，先把画面给用户看，
+        并让"照片没送达"这件事在报告抬头里显式暴露，而不是悄悄吞掉。
+        """
         photo = self.camera.capture("garden")
+        banners = self._warnings()
+        photo_push: Optional[Dict[str, Any]] = None
+
         if push:
-            self.bot.send_text(f"📷 已拍摄花园照片: {photo.name}，正在分析…")
+            if self.push_cfg.get("send_photo", True):
+                photo_push = self.bot.send_image(photo.resolve(), title="📷 今日花园")
+                if not photo_push.get("ok"):
+                    logger.error("照片推送失败: %s", photo_push.get("errmsg"))
+            else:
+                logger.info("push.send_photo=false，跳过照片推送")
+            self.bot.send_text(f"🔍 正在分析今日照片…{banners}")
+
         report = self.analyzer.analyze(photo)
+
+        extra = banners
+        if push and photo_push is not None and not photo_push.get("ok"):
+            extra += self._push_banner(photo_push)
+        if extra:
+            report = replace(report, markdown=extra.strip() + "\n\n" + report.markdown)
+
         if push:
             title = "🌿 花园生长报告"
             score = f"  健康评分 {report.score}/5" if report.score else ""
-            self.bot.send_markdown(title, f"# {title}{score}\n\n{report.markdown}")
+            sent = self.bot.send_markdown(title, f"# {title}{score}\n\n{report.markdown}")
+            if not sent.get("ok"):
+                logger.error("报告推送失败: %s", sent.get("errmsg"))
         return report
+
+    def note_subscriber(self, user_id: Optional[str]) -> bool:
+        """记录一个推送对象（Stream 收到消息时自动调用）。返回 True 表示新增。"""
+        return self.bot.subscribers.add(user_id)
 
     def take_photo_only(self, push: bool = True) -> str:
         photo = self.camera.capture("garden")
         if push:
-            self.bot.send_text(f"📷 已拍照: {photo.resolve()}")
+            self.bot.send_text(f"📷 已拍照: {photo.resolve()}{self._warnings()}")
         return str(photo.resolve())
+
+    def _warnings(self) -> str:
+        """把 mock / 画质两类告警拼成报告抬头，均为空时返回空串。"""
+        return self._mock_banner() + self._quality_banner()
+
+    def _mock_banner(self) -> str:
+        """相机处于 mock 模式时返回醒目提示（含分类原因），否则返回空串。"""
+        if not self.camera.is_mock:
+            return ""
+        return (
+            f"\n⚠️ [MOCK] 当前未使用真实相机，生成的是占位图，报告内容不可信"
+            f"（原因分类: {self.camera.error_kind or 'mock_hardware=true'}；"
+            f"详见日志或运行 `python tools/camera_diag.py`）"
+        )
+
+    def _quality_banner(self) -> str:
+        """成片画质异常时返回醒目提示。
+
+        模糊的照片照样能送进 AI，模型仍会一本正经地给出"叶色正常"之类的结论 ——
+        这是本项目最危险的静默失败，所以必须把画质结论显式顶到报告最前面。
+        """
+        q = self.camera.last_quality or {}
+        if not q or q.get("level") in (None, "ok"):
+            return ""
+        findings = "；".join(q.get("findings") or [])
+        advice = "；".join(q.get("advice") or [])
+        return (
+            f"\n⚠️ [画质告警] {findings}（清晰度 {q.get('sharpness')} / 对比度 {q.get('contrast')}）"
+            f"\n💡 {advice}"
+            f"\n详见 docs/camera_image_quality.md，或运行 `python tools/camera_diag.py --live`"
+        )
+
+    def _push_banner(self, result: Dict[str, Any]) -> str:
+        """推送失败时返回醒目提示 —— 照片没送达必须让用户在报告里就看到。"""
+        kind = result.get("error_kind") or "unknown"
+        hint = result.get("hint") or "运行 `python tools/dingtalk_diag.py` 排查。"
+        return (
+            f"\n⚠️ [推送失败:{kind}] 照片未能送达钉钉：{result.get('errmsg')}"
+            f"\n💡 {hint}"
+        )
 
     # ---------- 状态 ----------
     def status_text(self) -> str:
-        rows = ["**🌱 浇花助理状态**", "", "| 通道 | 植物 | 桶 | 上次浇水(s) | 计划 |", "|---|---|---|---|---|"]
+        cam = self.camera.status()
+        cam_line = (
+            f"**📷 相机**: {'⚠️ MOCK 占位图' if cam['is_mock'] else '✅ ' + cam['mode']}"
+            f" {cam['resolution']}"
+        )
+        if cam["is_mock"] and cam["error_kind"]:
+            cam_line += f"（[{cam['error_kind']}] {cam['mock_reason']}）"
+        if cam.get("resolution_hint"):
+            cam_line += f"\n> ⚠️ {cam['resolution_hint']}"
+        q = cam.get("last_quality") or {}
+        if q.get("level") in ("warn", "bad"):
+            cam_line += (
+                f"\n> ⚠️ 上次成片画质异常[{q['level']}]："
+                f"{'；'.join(q.get('findings') or [])}"
+            )
+        rows = ["**🌱 浇花助理状态**", "", cam_line, "", self._ai_status_line(), "",
+                self._push_status_line(), "",
+                "| 通道 | 植物 | 桶 | 上次浇水(s) | 计划 |", "|---|---|---|---|---|"]
         for s in self.valve.status():
             rows.append(
                 f"| {s['id']} | {s['name']} | {s['bucket']} | "
                 f"{s['last_duration_sec']} | `{s['schedule_cron'] or '-'}` |"
             )
         return "\n".join(rows)
+
+    def _ai_status_line(self) -> str:
+        """AI 分析通道状态 —— 让"报告其实是假的"这件事在状态里一眼可见。"""
+        info = self.analyzer.describe()
+        if info["available"]:
+            vision = "✅" if info["supports_vision"] else "❌ 不支持图片"
+            line = (f"**🤖 AI 分析**: ✅ {info['provider']} / {info['model']}"
+                    f"　视觉 {vision}")
+            if not info["supports_vision"]:
+                line += "\n> ⚠️ 当前模型不支持图片输入，拍照报告会直接失败（以免编造分析）"
+            last = info.get("last_error")
+            if last:
+                line += f"\n> ⚠️ 上次分析失败[{last['kind']}]：{last['message']}"
+            return line
+        kind = info["unavailable_kind"] or "unavailable"
+        line = f"**🤖 AI 分析**: ⚠️ 不可用（[{kind}] {info['unavailable_reason']}）"
+        if info["allow_mock_fallback"]:
+            line += "\n> ⚠️ allow_mock_fallback=true —— 报告是占位模板，内容不可信"
+        else:
+            line += "\n> 每日报告会显式失败并推送告警，不会静默给出假报告"
+        line += "\n> 💡 运行 `python tools/ai_diag.py` 排查"
+        return line
+
+    def _push_status_line(self) -> str:
+        """推送通道自检结果 —— 让"报告发不出去"这件事在状态里一眼可见。"""
+        st = self.bot.delivery_status()
+        label = {"robot": "✅ 企业机器人单聊", "webhook": "✅ 群 webhook",
+                 "none": "❌ 未配置"}[st["channel"]]
+        line = f"**📮 推送**: {label}　接收人 {len(st['recipients'])} 位"
+        if st["channel"] == "none":
+            missing = ", ".join(st["missing_credentials"]) or "全部凭证"
+            line += f"\n> ⚠️ 缺少 {missing} —— 每日照片/报告发不出去"
+        elif not st["recipients"]:
+            line += "\n> ⚠️ 还没有接收人：在钉钉里给机器人发一条消息即可自动订阅"
+        elif st["last_error"]:
+            line += f"\n> ⚠️ 上次推送失败[{st['last_error'].get('error_kind')}]：{st['last_error'].get('errmsg')}"
+        return line
 
     # ---------- 钉钉指令分发 ----------
     def handle_command(self, text: str, sender_id: Optional[str] = None) -> str:
@@ -96,7 +242,9 @@ class WateringAssistant:
                 return self.status_text()
             if cmd.action == "photo":
                 path = self.take_photo_only(push=False)
-                return f"📷 已拍照: {path}"
+                return f"📷 已拍照: {path}{self._warnings()}"
+            if cmd.action == "subscribe":
+                return self._handle_subscribe(sender_id)
             if cmd.action == "report":
                 report = self.take_photo_and_report(push=False)
                 score = f"  健康评分 {report.score}/5" if report.score else ""
@@ -110,9 +258,41 @@ class WateringAssistant:
                     f"✅ 已为「{result['name']}」浇水 {result['duration_sec']}s"
                 )
             return f"❓ 无法识别指令：{cmd.raw}\n\n{help_text()}"
+        except CameraError as exc:
+            # 相机类故障：显式分类 + 修复建议，绝不静默出占位图
+            logger.error("相机故障 [%s]: %s", exc.kind, exc)
+            return f"❌ 相机不可用 [{exc.kind}]：{exc}\n💡 {exc.hint}"
+        except AIError as exc:
+            # AI 类故障：同样显式分类，绝不拿占位报告冒充分析结果
+            logger.error("AI 分析失败 [%s]: %s", exc.kind, exc)
+            return f"❌ AI 分析不可用 [{exc.kind}]：{exc}\n💡 {exc.hint}"
         except Exception as exc:  # noqa: BLE001
             logger.exception("指令执行失败")
             return f"❌ 执行失败：{exc}"
+
+    def _handle_subscribe(self, sender_id: Optional[str]) -> str:
+        """「订阅」指令：把当前用户加入每日推送名单。
+
+        这也是推送通道能工作的前提 —— 钉钉不允许机器人凭空发起单聊，
+        用户必须先在单聊里说过话。
+        """
+        if not sender_id:
+            return "⚠️ 无法识别你的钉钉账号，请直接在本对话里发送「订阅」。"
+        added = self.note_subscriber(sender_id)
+        st = self.bot.delivery_status()
+        if st["channel"] == "none":
+            missing = ", ".join(st["missing_credentials"]) or "全部凭证"
+            return (f"📝 已记录你的账号，但推送通道尚未配置（缺少 {missing}），"
+                    f"暂时发不出消息，请联系管理员。")
+        return (
+            f"✅ 已开启每日推送{'（新增订阅）' if added else '（你已在名单中）'}！\n"
+            f"每天 **{self._daily_report_time()}** 会把花园照片和生长报告发到这里。\n"
+            f"当前接收人共 {len(st['recipients'])} 位。"
+        )
+
+    def _daily_report_time(self) -> str:
+        dr = self.push_cfg.get("daily_report", {}) or {}
+        return f"{int(dr.get('hour', 13)):02d}:{int(dr.get('minute', 0)):02d}"
 
     def _resolve_channel(self, target: str) -> Optional[Dict[str, Any]]:
         if not target:
@@ -124,6 +304,11 @@ class WateringAssistant:
         if m:
             return get_channel(self.cfg, int(m.group(1)))
         return find_channel_by_name(self.cfg, target)
+
+    # ---------- 失败通知 ----------
+    def notify_failure(self, what: str, exc: Exception) -> None:
+        """把定时任务失败推给用户 —— 否则用户只会觉得"今天没收到报告"，却不知道原因。"""
+        self.bot.send_text(f"❌ {what}\n原因：{exc}\n（完整堆栈见树莓派日志）")
 
     # ---------- 资源释放 ----------
     def shutdown(self) -> None:

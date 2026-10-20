@@ -4,7 +4,10 @@ from typing import Any, Dict
 
 import pytest
 
-from hardware.valve_controller import ValveController
+import _bootstrap  # noqa: F401  必须在导入项目模块之前执行：把仓库根目录加入 sys.path
+from hardware import valve_controller as vc_mod
+from hardware.errors import HardwareError
+from hardware.valve_controller import ValveController, _MockGpioBackend
 
 
 def test_valve_init_mock(mock_config: Dict[str, Any]):
@@ -13,6 +16,30 @@ def test_valve_init_mock(mock_config: Dict[str, Any]):
     assert len(valve.channels) == 4
     assert valve.channels[1].name == "热带植物"
     assert valve.channels[2].pin == 27
+    valve.cleanup()
+
+
+# ---------- GPIO 失败时的行为（绝不静默降级） ----------
+def _broken_backend(*_a, **_kw):
+    raise ModuleNotFoundError("No module named 'gpiod'")
+
+
+def test_gpio_strict_raises_when_unavailable(mock_config: Dict[str, Any], monkeypatch):
+    """mock=False 且不允许回退时，GPIO 不可用必须抛 HardwareError。"""
+    monkeypatch.setattr(vc_mod, "_GpiodBackend", _broken_backend)
+    monkeypatch.setattr(vc_mod, "_RpiGpioBackend", _broken_backend)
+    with pytest.raises(HardwareError) as ei:
+        ValveController(mock_config["channels"], mock=False, allow_mock_fallback=False)
+    assert ei.value.kind == "not_found"
+    assert ei.value.hint
+
+
+def test_gpio_explicit_fallback_uses_mock_backend(mock_config: Dict[str, Any], monkeypatch):
+    """显式允许回退时才使用 mock 后端。"""
+    monkeypatch.setattr(vc_mod, "_GpiodBackend", _broken_backend)
+    monkeypatch.setattr(vc_mod, "_RpiGpioBackend", _broken_backend)
+    valve = ValveController(mock_config["channels"], mock=False, allow_mock_fallback=True)
+    assert isinstance(valve.backend, _MockGpioBackend)
     valve.cleanup()
 
 
@@ -100,3 +127,7 @@ def test_unknown_channel(mock_config: Dict[str, Any]):
     with pytest.raises(ValueError, match="未知通道"):
         valve.water(99)
     valve.cleanup()
+
+
+if __name__ == "__main__":
+    _bootstrap.run(__file__)

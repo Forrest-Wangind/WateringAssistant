@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from hardware.errors import HardwareError
+
 logger = logging.getLogger(__name__)
 
 
@@ -114,18 +116,35 @@ class _MockGpioBackend(_GpioBackend):
         self.state.clear()
 
 
-def _make_backend(mock: bool) -> _GpioBackend:
+def _make_backend(mock: bool, allow_mock_fallback: bool = False) -> _GpioBackend:
     if mock:
         return _MockGpioBackend()
-    try:
-        return _GpiodBackend()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        return _RpiGpioBackend()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("GPIO 后端不可用，自动回退到 mock 模式: %s", exc)
+    errors = []
+    for factory in (_GpiodBackend, _RpiGpioBackend):
+        try:
+            return factory()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{factory.__name__}: {exc}")
+    detail = " | ".join(errors) or "无可用后端"
+    if allow_mock_fallback:
+        logger.warning(
+            "⚠️ GPIO 后端全部不可用，按 safety.allow_mock_fallback=true 降级为 mock："
+            "本次运行的浇水操作不会真正开阀！详情: %s",
+            detail,
+        )
         return _MockGpioBackend()
+    kind = "not_found"
+    hint = (
+        "树莓派上请安装 GPIO 后端：sudo apt install -y python3-gpiod（或 pip install RPi.GPIO），"
+        "并把运行用户加入 gpio 组；确认后重试。若只想在本机跑通流程，"
+        "请把 config.yaml 的 system.mock_hardware 设为 true。"
+    )
+    logger.error("GPIO 后端不可用 [%s]: %s\n修复建议: %s", kind, detail, hint)
+    raise HardwareError(
+        f"GPIO 后端不可用（尝试 gpiod / RPi.GPIO 均失败）: {detail}",
+        kind=kind,
+        hint=hint,
+    )
 
 
 # ---------- 通道 ----------
@@ -152,8 +171,9 @@ class ValveController:
         max_single_run_sec: int = 180,
         cooldown_sec: int = 30,
         global_lock: bool = True,
+        allow_mock_fallback: bool = False,
     ) -> None:
-        self.backend = _make_backend(mock)
+        self.backend = _make_backend(mock, allow_mock_fallback)
         self.channels: Dict[int, Channel] = {}
         for c in channels:
             ch = Channel(

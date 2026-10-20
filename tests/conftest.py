@@ -84,13 +84,24 @@ def mock_config(temp_dirs: Dict[str, Path]) -> Dict[str, Any]:
             "api_key_env": "ANTHROPIC_API_KEY",
             "max_tokens": 1500,
             "prompt": "请分析植物生长状况",
+            # 测试环境没有真实 Key：显式允许降级，让全流程在无网环境下可跑通。
+            # 想验证 fail-fast 的用例请显式传 allow_mock_fallback=False。
+            "allow_mock_fallback": True,
         },
         "dingtalk": {
             "webhook_env": "DINGTALK_WEBHOOK",
             "secret_env": "DINGTALK_SECRET",
             "client_id_env": "DINGTALK_CLIENT_ID",
             "client_secret_env": "DINGTALK_CLIENT_SECRET",
+            "robot_code_env": "DINGTALK_ROBOT_CODE",
+            "subscribers_file": str(temp_dirs["data_dir"] / "subscribers.json"),
+            "user_ids": [],
             "allowed_users": [],
+        },
+        "push": {
+            "enabled": True,
+            "send_photo": True,
+            "daily_report": {"hour": 13, "minute": 0},
         },
         "web": {
             "host": "0.0.0.0",
@@ -102,11 +113,11 @@ def mock_config(temp_dirs: Dict[str, Path]) -> Dict[str, Any]:
 @pytest.fixture
 def mock_env(monkeypatch) -> None:
     """清空敏感环境变量，避免测试意外调用真实 API。"""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("DINGTALK_WEBHOOK", raising=False)
-    monkeypatch.delenv("DINGTALK_SECRET", raising=False)
-    monkeypatch.delenv("DINGTALK_CLIENT_ID", raising=False)
-    monkeypatch.delenv("DINGTALK_CLIENT_SECRET", raising=False)
+    for var in ("ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY",
+                "MOONSHOT_API_KEY", "DASHSCOPE_API_KEY", "ZHIPU_API_KEY",
+                "DINGTALK_WEBHOOK", "DINGTALK_SECRET",
+                "DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET", "DINGTALK_ROBOT_CODE"):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture

@@ -8,6 +8,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from assistant import WateringAssistant
+from ai.errors import AIError
+from hardware.camera import CameraError
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +28,10 @@ def create_app(assistant: WateringAssistant) -> FastAPI:
 
     @app.get("/api/status")
     def status():
-        return {"channels": assistant.valve.status()}
+        return {
+            "channels": assistant.valve.status(),
+            "camera": assistant.camera.status(),
+        }
 
     @app.post("/api/water")
     def water(req: WaterRequest):
@@ -37,16 +42,31 @@ def create_app(assistant: WateringAssistant) -> FastAPI:
 
     @app.post("/api/report")
     def report():
-        r = assistant.take_photo_and_report(push=False)
+        try:
+            r = assistant.take_photo_and_report(push=False)
+        except CameraError as exc:
+            raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        except AIError as exc:
+            # AI 不可用时显式报错（含分类与修复建议），而不是返回一份占位报告
+            raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
         return {
             "photo": str(r.photo_path),
             "report": str(r.report_path),
             "score": r.score,
             "markdown": r.markdown,
+            "degraded": r.degraded,
+            "degraded_reason": r.degraded_reason,
+            "model": r.model,
+            "camera": assistant.camera.status(),
         }
 
     @app.post("/api/photo")
     def photo():
-        return {"photo": assistant.take_photo_only(push=False)}
+        try:
+            path = assistant.take_photo_only(push=False)
+        except CameraError as exc:
+            raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        return {"photo": path, "is_mock": assistant.camera.is_mock,
+                "camera": assistant.camera.status()}
 
     return app
